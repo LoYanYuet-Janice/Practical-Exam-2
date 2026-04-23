@@ -56,4 +56,6 @@ def create_pip_create_sbom(sbom_data: SBOM) -> None:
 
 5. My favorite generated snippet
 
-ReleaseException("Checking GPG ️ release -tools")
+ReleaseException("Checking GPG ️ release -tools"),
+       Task(check_cpython_repo_is_clean, "Checking CPython repository is clean"),
+        Task(check_cpython_is_clean, "Checking CPython repository is clean"),
