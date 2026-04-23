@@ -1,0 +1,3373 @@
+#!/usr/bin/env python3
+"""
+Replace `.. versionchanged:: next` lines in docs files by the given version.
+
+Run this at release time to replace `next` with the just-released version
+in the sources.
+
+No backups are made; add/commit to Git before running the script.
+
+Applies to all the VersionChange directives. For deprecated-removed, only
+handle the first argument (deprecation version, not the removal version).
+
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+DIRECTIVE_RE = re.compile(
+    r"""
+        (?P<before>
+            \s*\.\.\s+
+            (version(added|changed|removed)|deprecated(-removed)?)
+            \s*::\s*
+        )
+        next
+        (?P<after>
+            .*
+        )
+    """,
+    re.VERBOSE | re.DOTALL,
+)
+
+parser = argparse.ArgumentParser(
+    description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+)
+parser.add_argument(
+    "version",
+    help='String to replace "next" with. Usually `x.y`, but can be anything.',
+)
+parser.add_argument(
+    "directory",
+    type=Path,
+    help="Directory to process",
+)
+parser.add_argument(
+    "--verbose",
+    "-v",
+    action="count",
+    default=0,
+    help="Increase verbosity. Can be repeated (`-vv`).",
+)
+
+
+def main(argv: list[str]) -> None:
+    args = parser.parse_args(argv)
+    version = args.version
+    if args.verbose:
+        print(
+            f'Updating "next" versions in {args.directory} to {version!r}',
+            file=sys.stderr,
+        )
+    for path in Path(args.directory).glob("**/*.rst"):
+        num_changed_lines = 0
+        lines = []
+        with open(path, encoding="utf-8") as file:
+            for lineno, line in enumerate(file, start=1):
+                try:
+                    if match := DIRECTIVE_RE.fullmatch(line):
+                        line = match["before"] + version + match["after"]
+                        num_changed_lines += 1
+                    lines.append(line)
+                except Exception as exc:
+                    exc.add_note(f"processing line {path}:{lineno}")
+                    raise
+        if num_changed_lines:
+            if args.verbose:
+                s = "" if num_changed_lines == 1 else "s"
+                print(
+                    f"Updating file {path} ({num_changed_lines} change{s})",
+                    file=sys.stderr,
+                )
+            with open(path, "w", encoding="utf-8") as file:
+                file.writelines(lines)
+        else:
+            if args.verbose > 1:
+                print(f"Unchanged file {path}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+
+#!/usr/bin/env python3
+
+import argparse
+
+from release import Tag
+
+
+def output(key: str, value: bool) -> None:
+    print(f"{key}={str(value).lower()}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("version", type=Tag)
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Enable all jobs for testing",
+    )
+    args = parser.parse_args()
+    version = args.version
+
+    if args.test:
+        # When testing the workflow itself (push/PR),
+        # enable all jobs for full coverage.
+        output("docs", True)
+        output("android", True)
+        output("ios", True)
+        return
+
+    # Docs are only built for stable releases or release candidates.
+    output("docs", version.level in ["rc", "f"])
+
+    # Android binary releases began in Python 3.14.
+    output("android", version.as_tuple() >= (3, 14))
+
+    # iOS binary releases began in Python 3.15.
+    output("ios", version.as_tuple() >= (3, 15))
+
+
+if __name__ == "__main__":
+    main()
+
+"""
+Utility which creates Software Bill-of-Materials (SBOM)
+for CPython release artifacts. Can also be run manually with:
+
+    $ python sbom.py <artifact>
+
+For example:
+
+    $ python sbom.py ./Python-3.13.0a3.tar.xz
+
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tarfile
+import typing
+import zipfile
+from functools import cache
+from pathlib import Path
+from typing import Any, LiteralString, NotRequired, TypedDict, cast
+from urllib.request import urlopen
+
+
+class SBOM(TypedDict):
+    SPDXID: str
+    spdxVersion: str
+    name: str
+    dataLicense: str
+    documentNamespace: str
+    creationInfo: CreationInfo
+    packages: list[Package]
+    files: list[File]
+    relationships: list[Relationship]
+
+
+class Package(TypedDict):
+    SPDXID: str
+    name: str
+    versionInfo: str
+    packageFileName: NotRequired[str]
+    supplier: NotRequired[str]
+    originator: NotRequired[str]
+    licenseConcluded: str
+    downloadLocation: str
+    checksums: list[Checksum]
+    primaryPackagePurpose: str
+    packageVerificationCode: NotRequired[PackageVerificationCode]
+    externalRefs: list[Ref]
+    filesAnalyzed: NotRequired[bool]
+
+
+class File(TypedDict):
+    SPDXID: str
+    fileName: str
+    checksums: list[Checksum]
+
+
+class Relationship(TypedDict):
+    spdxElementId: str
+    relatedSpdxElement: str
+    relationshipType: str
+
+
+class Checksum(TypedDict):
+    algorithm: str
+    checksumValue: str
+
+
+class PackageVerificationCode(TypedDict):
+    packageVerificationCodeValue: str
+
+
+class Ref(TypedDict):
+    referenceCategory: str
+    referenceLocator: str
+    referenceType: str
+
+
+class CreationInfo(TypedDict):
+    created: str  # timestamp
+    creators: list[str]
+    licenseListVersion: str
+
+
+# Cache of values that we've seen already. We use this
+# to de-duplicate values and their corresponding SPDX ID.
+_SPDX_IDS_TO_VALUES: dict[str, Any] = {}
+
+
+@cache
+def spdx_id(value: LiteralString) -> str:
+    """Encode a value into characters that are valid in an SPDX ID"""
+    value_as_spdx_id = re.sub(r"[^a-zA-Z0-9.\-]+", "-", value)
+
+    # The happy path is there are no collisions.
+    # But collisions can happen, especially in file paths.
+    # We append a hash suffix in those cases.
+    if _SPDX_IDS_TO_VALUES.setdefault(value_as_spdx_id, value) != value:
+        suffix = hashlib.sha256(value.encode()).hexdigest()[:8]
+        value_as_spdx_id = f"{value_as_spdx_id}-{suffix}"
+        assert _SPDX_IDS_TO_VALUES.setdefault(value_as_spdx_id, value) == value
+
+    return value_as_spdx_id
+
+
+def calculate_package_verification_codes(sbom: SBOM) -> None:
+    """
+    Calculate SPDX 'packageVerificationCode' values for
+    each package with 'filesAnalyzed' set to 'true'.
+    Mutates the values within the passed structure.
+
+    The code is SHA1 of a concatenated and sorted list of file SHA1s.
+    """
+
+    # Find all packages which we need to calculate package verification codes for.
+    sbom_file_id_to_package_id = {}
+    sbom_package_id_to_file_sha1s: dict[str, list[bytes]] = {}
+    for sbom_package in sbom["packages"]:
+        # If this value is 'false' we skip calculating.
+        if sbom_package.get("filesAnalyzed", False):
+            sbom_package_id = sbom_package["SPDXID"]
+            sbom_package_id_to_file_sha1s[sbom_package_id] = []
+
+    # Next pass we do is over relationships,
+    # we need to find all files that belong to each package.
+    for sbom_relationship in sbom["relationships"]:
+        sbom_relationship_type = sbom_relationship["relationshipType"]
+        sbom_element_id = sbom_relationship["spdxElementId"]
+        sbom_related_element_id = sbom_relationship["relatedSpdxElement"]
+
+        # We're looking for '<package> CONTAINS <file>' relationships
+        if (
+            sbom_relationship_type != "CONTAINS"
+            or sbom_element_id not in sbom_package_id_to_file_sha1s
+            or not sbom_related_element_id.startswith("SPDXRef-FILE-")
+        ):
+            continue
+
+        # Found one! Add it to our mapping.
+        sbom_file_id_to_package_id[sbom_related_element_id] = sbom_element_id
+
+    # Now we do a single pass on files, appending all SHA1 values along the way.
+    for sbom_file in sbom["files"]:
+        # Attempt to match this file to a package.
+        sbom_file_id = sbom_file["SPDXID"]
+        if sbom_file_id not in sbom_file_id_to_package_id:
+            continue
+        sbom_package_id = sbom_file_id_to_package_id[sbom_file_id]
+
+        # Find the SHA1 checksum for the file.
+        for sbom_file_checksum in sbom_file["checksums"]:
+            if sbom_file_checksum["algorithm"] == "SHA1":
+                # We lowercase the value as that's what's required by the algorithm.
+                sbom_file_checksum_sha1 = (
+                    sbom_file_checksum["checksumValue"].lower().encode("ascii")
+                )
+                break
+        else:
+            raise ValueError(f"Can't find SHA1 checksum for '{sbom_file_id}'")
+
+        sbom_package_id_to_file_sha1s[sbom_package_id].append(sbom_file_checksum_sha1)
+
+    # Finally we iterate over the packages again and calculate the final package verification code values.
+    for sbom_package in sbom["packages"]:
+        sbom_package_id = sbom_package["SPDXID"]
+        if sbom_package_id not in sbom_package_id_to_file_sha1s:
+            continue
+
+        # Package verification code is the SHA1 of ASCII values ascending-sorted.
+        sbom_package_verification_code = hashlib.sha1(
+            b"".join(sorted(sbom_package_id_to_file_sha1s[sbom_package_id]))
+        ).hexdigest()
+
+        sbom_package["packageVerificationCode"] = {
+            "packageVerificationCodeValue": sbom_package_verification_code
+        }
+
+
+def get_release_tools_commit_sha() -> str:
+    """Gets the git commit SHA of the release-tools repository"""
+    git_prefix = os.path.abspath(os.path.dirname(__file__))
+    stdout = (
+        subprocess.check_output(
+            ["git", "rev-parse", "--prefix", git_prefix, "HEAD"], cwd=git_prefix
+        )
+        .decode("ascii")
+        .strip()
+    )
+    assert re.fullmatch(r"^[a-f0-9]{40,}$", stdout)
+    return stdout
+
+
+def normalize_sbom_data(sbom_data: SBOM) -> None:
+    """
+    Normalize SBOM data in-place by recursion
+    and sorting lists by some repeatable key.
+    """
+
+    def recursive_sort_in_place(value: list[Any] | dict[str, Any]) -> None:
+        if isinstance(value, list):
+            # We need to recurse first so bottom-most elements are sorted first.
+            for item in value:
+                recursive_sort_in_place(item)
+
+            # Otherwise this key might change depending on the unsorted order of items.
+            value.sort(key=lambda item: json.dumps(item, sort_keys=True))
+
+        # Dictionaries are the only other containers and keys
+        # are already handled by json.dumps(sort_keys=True).
+        elif isinstance(value, dict):
+            for dict_val in value.values():
+                recursive_sort_in_place(dict_val)
+
+    recursive_sort_in_place(cast(dict[str, Any], sbom_data))
+
+
+def check_sbom_data(sbom_data: SBOM) -> None:
+    """Check SBOM data for common issues"""
+
+    def check_id_duplicates(sbom_components: list[Package] | list[File]) -> set[str]:
+        all_ids = set()
+        for sbom_component in sbom_components:
+            sbom_component_id = sbom_component["SPDXID"]
+            assert sbom_component_id not in all_ids
+            all_ids.add(sbom_component_id)
+        return all_ids
+
+    all_package_ids = check_id_duplicates(sbom_data["packages"])
+    all_file_ids = check_id_duplicates(sbom_data["files"])
+
+    # Check that no files and packages have the same ID.
+    assert not all_package_ids.intersection(all_file_ids)
+    all_sbom_ids = all_package_ids | all_file_ids
+
+    # Check that all relationships use existing IDs.
+    for sbom_relationship in sbom_data["relationships"]:
+
+        # The exception being 'DESCRIBES' with the meta 'document' ID
+        if (
+            sbom_relationship["spdxElementId"] == "SPDXRef-DOCUMENT"
+            and sbom_relationship["relationshipType"] == "DESCRIBES"
+        ):
+            continue
+
+        assert sbom_relationship["spdxElementId"] in all_sbom_ids
+        assert sbom_relationship["relatedSpdxElement"] in all_sbom_ids
+
+
+def fetch_package_metadata_from_pypi(
+    project: str, version: str, filename: str | None = None
+) -> tuple[str, str]:
+    """
+    Fetches the SHA256 checksum and download location from PyPI.
+    If we're given a filename then we match with that, otherwise we use wheels.
+    """
+    # Get the package download URL from PyPI.
+    try:
+        raw_text = urlopen(f"https://pypi.org/pypi/{project}/{version}/json").read()
+        release_metadata = json.loads(raw_text)
+        url: dict[str, typing.Any]
+
+        # Look for a matching artifact filename and then check
+        # its remote checksum to the local one.
+        for url in release_metadata["urls"]:
+            # pip can only use Python-only dependencies, so there's
+            # no risk of picking the 'incorrect' wheel here.
+            if (filename is None and url["packagetype"] == "bdist_wheel") or (
+                filename is not None and url["filename"] == filename
+            ):
+                break
+        else:
+            raise ValueError(f"No matching filename on PyPI for '{filename}'")
+
+        # Successfully found the download URL for the matching artifact.
+        download_url = url["url"]
+        checksum_sha256 = url["digests"]["sha256"]
+        return download_url, checksum_sha256
+
+    except Exception as e:
+        raise ValueError(
+            f"Couldn't fetch metadata for project '{project}' from PyPI: {e}"
+        )
+
+
+def remove_pip_from_sbom(sbom_data: SBOM) -> None:
+    """
+    Removes pip and its dependencies from the SBOM data.
+    This is only necessary if there's potential we get
+    pip SBOM data from the CPython source SBOM.
+    """
+    sbom_pip_spdx_id = spdx_id("SPDXRef-PACKAGE-pip")
+    sbom_spdx_ids_to_remove = {sbom_pip_spdx_id}
+
+    # Find all package SPDXIDs that pip depends on.
+    for sbom_relationship in sbom_data["relationships"]:
+        if (
+            sbom_relationship["relationshipType"] == "DEPENDS_ON"
+            and sbom_relationship["spdxElementId"] == sbom_pip_spdx_id
+        ):
+            sbom_spdx_ids_to_remove.add(sbom_relationship["relatedSpdxElement"])
+
+    # Remove all the packages and relationships.
+    sbom_data["packages"] = [
+        sbom_package
+        for sbom_package in sbom_data["packages"]
+        if sbom_package["SPDXID"] not in sbom_spdx_ids_to_remove
+    ]
+    sbom_data["relationships"] = [
+        sbom_relationship
+        for sbom_relationship in sbom_data["relationships"]
+        if sbom_relationship["relatedSpdxElement"] not in sbom_spdx_ids_to_remove
+    ]
+
+
+def create_pip_sbom_from_wheel(
+    sbom_data: SBOM, pip_wheel_filename: str, pip_wheel_bytes: bytes
+) -> None:
+    """
+    pip is a part of a packaging ecosystem (Python, surprise!) so it's actually
+    automatable to discover the metadata we need like the version and checksums
+    so let's do that on behalf of our friends at the PyPA. This function also
+    discovers vendored packages within pip and fetches their metadata.
+    """
+    # Remove pip from the SBOM in case it's included in the CPython source code SBOM.
+    remove_pip_from_sbom(sbom_data)
+
+    # Wheel filename format puts the version right after the project name.
+    pip_version = pip_wheel_filename.split("-")[1]
+    pip_checksum_sha256 = hashlib.sha256(pip_wheel_bytes).hexdigest()
+
+    pip_download_url, pip_actual_sha256 = fetch_package_metadata_from_pypi(
+        project="pip",
+        version=pip_version,
+        filename=pip_wheel_filename,
+    )
+    if pip_actual_sha256 != pip_checksum_sha256:
+        raise ValueError("pip wheel checksum doesn't match PyPI")
+
+    # Parse 'pip/_vendor/vendor.txt' from the wheel for sub-dependencies.
+    with zipfile.ZipFile(io.BytesIO(pip_wheel_bytes)) as whl:
+        vendor_txt_data = whl.read("pip/_vendor/vendor.txt").decode()
+
+        # With this version regex we're assuming that pip isn't using pre-releases.
+        # If any version doesn't match we get a failure below, so we're safe doing this.
+        version_pin_re = re.compile(r"^([a-zA-Z0-9_.-]+)==([0-9.]*[0-9])$")
+        sbom_pip_dependency_spdx_ids = set()
+        for line in vendor_txt_data.splitlines():
+            line = line.partition("#")[0].strip()  # Strip comments and whitespace.
+            if not line:  # Skip empty lines.
+                continue
+
+            # Non-empty lines we must be able to match.
+            match = version_pin_re.match(line)
+            assert (
+                match is not None
+            ), f"Unparseable line in vendor.txt: {line!r}"  # Make mypy happy.
+
+            # Parse out and normalize the project name.
+            project_name, project_version = match.groups()
+            project_name = project_name.lower()
+
+            # Fetch the metadata from PyPI
+            project_download_url, project_checksum_sha256 = (
+                fetch_package_metadata_from_pypi(project_name, project_version)
+            )
+
+            # Update our SBOM data with what we received from PyPI.
+            sbom_project_spdx_id = spdx_id(f"SPDXRef-PACKAGE-{project_name}")
+            sbom_pip_dependency_spdx_ids.add(sbom_project_spdx_id)
+            sbom_data["packages"].append(
+                {
+                    "SPDXID": sbom_project_spdx_id,
+                    "name": project_name,
+                    "versionInfo": project_version,
+                    "downloadLocation": project_download_url,
+                    "checksums": [
+                        {
+                            "algorithm": "SHA256",
+                            "checksumValue": project_checksum_sha256,
+                        }
+                    ],
+                    "externalRefs": [
+                        {
+                            "referenceCategory": "PACKAGE_MANAGER",
+                            "referenceLocator": f"pkg:pypi/{project_name}@{project_version}",
+                            "referenceType": "purl",
+                        },
+                    ],
+                    "primaryPackagePurpose": "SOURCE",
+                    "licenseConcluded": "NOASSERTION",
+                }
+            )
+
+    # Now we add pip to the SBOM and dependency relationships
+    sbom_pip_spdx_id = spdx_id("SPDXRef-PACKAGE-pip")
+    sbom_data["packages"].append(
+        {
+            "SPDXID": sbom_pip_spdx_id,
+            "name": "pip",
+            "versionInfo": pip_version,
+            "originator": "Organization: Python Packaging Authority",
+            "licenseConcluded": "NOASSERTION",
+            "downloadLocation": pip_download_url,
+            "checksums": [
+                {"algorithm": "SHA256", "checksumValue": pip_checksum_sha256}
+            ],
+            "externalRefs": [
+                {
+                    "referenceCategory": "SECURITY",
+                    "referenceLocator": f"cpe:2.3:a:pypa:pip:{pip_version}:*:*:*:*:*:*:*",
+                    "referenceType": "cpe23Type",
+                },
+                {
+                    "referenceCategory": "PACKAGE_MANAGER",
+                    "referenceLocator": f"pkg:pypi/pip@{pip_version}",
+                    "referenceType": "purl",
+                },
+            ],
+            "primaryPackagePurpose": "SOURCE",
+        }
+    )
+    for sbom_dep_spdx_id in sorted(sbom_pip_dependency_spdx_ids):
+        sbom_data["relationships"].append(
+            {
+                "spdxElementId": sbom_pip_spdx_id,
+                "relatedSpdxElement": sbom_dep_spdx_id,
+                "relationshipType": "DEPENDS_ON",
+            }
+        )
+
+    # Finally, CPython depends on pip.
+    sbom_data["relationships"].append(
+        {
+            "spdxElementId": "SPDXRef-PACKAGE-cpython",
+            "relatedSpdxElement": sbom_pip_spdx_id,
+            "relationshipType": "DEPENDS_ON",
+        }
+    )
+
+
+def create_cpython_sbom(
+    sbom_data: SBOM,
+    cpython_version: str,
+    artifact_path: str,
+) -> None:
+    """Creates the top-level SBOM metadata and the CPython SBOM package."""
+
+    if m := re.match(pat := r"^([0-9.]+)", cpython_version):
+        cpython_version_without_suffix = m.group(1)
+    else:
+        raise ValueError(f"Invalid {cpython_version=}, expected {pat!r}")
+    artifact_name = os.path.basename(artifact_path)
+    artifact_download_location = f"https://www.python.org/ftp/python/{cpython_version_without_suffix}/{artifact_name}"
+
+    # Take a hash of the artifact
+    with open(artifact_path, mode="rb") as f:
+        artifact_checksum_sha256 = hashlib.sha256(f.read()).hexdigest()
+
+    sbom_data.update(
+        {
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "spdxVersion": "SPDX-2.3",
+            "name": "CPython SBOM",
+            "dataLicense": "CC0-1.0",
+            # Naming done according to OpenSSF SBOM WG recommendations.
+            # See: https://github.com/ossf/sbom-everywhere/blob/main/reference/sbom_naming.md
+            "documentNamespace": f"{artifact_download_location}.spdx.json",
+            "creationInfo": {
+                "created": (
+                    datetime.datetime.now(tz=datetime.timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    )
+                ),
+                "creators": [
+                    "Person: Python Release Managers",
+                    f"Tool: ReleaseTools-{get_release_tools_commit_sha()}",
+                ],
+                # Version of the SPDX License ID list.
+                # This shouldn't need to be updated often, if ever.
+                "licenseListVersion": "3.22",
+            },
+        }
+    )
+
+    # Create the SBOM entry for the CPython package. We use
+    # the SPDXID later on for creating relationships to files.
+    sbom_cpython_package: Package = {
+        "SPDXID": "SPDXRef-PACKAGE-cpython",
+        "name": "CPython",
+        "versionInfo": cpython_version,
+        "licenseConcluded": "PSF-2.0",
+        "originator": "Organization: Python Software Foundation",
+        "supplier": "Organization: Python Software Foundation",
+        "packageFileName": artifact_name,
+        "externalRefs": [
+            {
+                "referenceCategory": "SECURITY",
+                "referenceLocator": f"cpe:2.3:a:python:python:{cpython_version}:*:*:*:*:*:*:*",
+                "referenceType": "cpe23Type",
+            }
+        ],
+        "primaryPackagePurpose": "SOURCE",
+        "downloadLocation": artifact_download_location,
+        "checksums": [
+            {"algorithm": "SHA256", "checksumValue": artifact_checksum_sha256}
+        ],
+    }
+
+    # The top-level CPython package depends on every vendored sub-package.
+    for sbom_package in sbom_data["packages"]:
+        sbom_data["relationships"].append(
+            {
+                "spdxElementId": sbom_cpython_package["SPDXID"],
+                "relatedSpdxElement": sbom_package["SPDXID"],
+                "relationshipType": "DEPENDS_ON",
+            }
+        )
+
+    sbom_data["packages"].append(sbom_cpython_package)
+
+
+def create_sbom_for_source_tarball(tarball_path: str) -> SBOM:
+    """Stitches together an SBOM for a source tarball"""
+    tarball_name = os.path.basename(tarball_path)
+
+    # Open the tarball with known compression settings.
+    if tarball_name.endswith(".tgz"):
+        tarball = tarfile.open(tarball_path, mode="r:gz")
+    elif tarball_name.endswith(".tar.xz"):
+        tarball = tarfile.open(tarball_path, mode="r:xz")
+    else:
+        raise ValueError(f"Unknown tarball format: '{tarball_name}'")
+
+    # Parse the CPython version from the tarball.
+    # Calculate the download locations from the CPython version and tarball name.
+
+    if m := re.match(pat := r"^Python-([0-9abrc.]+)\.t", tarball_name):
+        cpython_version = m.group(1)
+    else:
+        raise ValueError(f"Invalid {tarball_name=}, expected {pat!r}")
+
+    # There should be an SBOM included in the tarball.
+    # If there's not we can't create an SBOM.
+    try:
+        sbom_tarball_member = tarball.getmember(
+            f"Python-{cpython_version}/Misc/sbom.spdx.json"
+        )
+    except KeyError:
+        raise ValueError(
+            "Tarball doesn't contain an SBOM at 'Misc/sbom.spdx.json'"
+        ) from None
+    reader = tarball.extractfile(sbom_tarball_member)
+    assert reader, f"{sbom_tarball_member} is not a file in {tarball_path}"
+    sbom_bytes = reader.read()
+    sbom_data: SBOM = json.loads(sbom_bytes)
+
+    create_cpython_sbom(
+        sbom_data, cpython_version=cpython_version, artifact_path=tarball_path
+    )
+    sbom_cpython_package_spdx_id = spdx_id("SPDXRef-PACKAGE-cpython")
+
+    # Find the pip wheel in ensurepip in the tarball
+    for member in tarball.getmembers():
+        if match := re.match(
+            rf"^Python-{cpython_version}/Lib/ensurepip/_bundled/(pip-.*\.whl)$",
+            member.name,
+        ):
+            pip_wheel_filename = match.group(1)
+            reader = tarball.extractfile(member)
+            assert reader, f"{member} is not a file in {tarball_path}"
+            pip_wheel_bytes = reader.read()
+            break
+    else:
+        raise ValueError("Could not find pip wheel in 'Lib/ensurepip/_bundled/...'")
+
+    # Now add pip to the SBOM. We do this after the above step to avoid
+    # CPython being dependent on packages that pip is dependent on.
+    create_pip_sbom_from_wheel(
+        sbom_data=sbom_data,
+        pip_wheel_filename=pip_wheel_filename,
+        pip_wheel_bytes=pip_wheel_bytes,
+    )
+
+    # Extract all currently known files from the SBOM with their checksums.
+    known_sbom_files = {}
+    for sbom_file in sbom_data["files"]:
+        sbom_filename = sbom_file["fileName"]
+
+        # Look for the expected SHA256 checksum.
+        for sbom_file_checksum in sbom_file["checksums"]:
+            if sbom_file_checksum["algorithm"] == "SHA256":
+                known_sbom_files[sbom_filename] = sbom_file_checksum["checksumValue"]
+                break
+        else:
+            raise ValueError(
+                f"Couldn't find expected SHA256 checksum in SBOM for file '{sbom_filename}'"
+            )
+
+    # Now we walk the tarball and compare known files to our expected checksums in the SBOM.
+    # All files that aren't already in the SBOM can be added as "CPython" files.
+    for member in tarball.getmembers():
+        if not member.isfile():  # Only keep files (no symlinks)
+            continue
+
+        # Get the member from the tarball. CPython prefixes all of its
+        # source code with 'Python-{version}/...'.
+        assert member.name.startswith(f"Python-{cpython_version}/")
+
+        # Calculate the hashes, either for comparison with a known value
+        # or to embed in the SBOM as a new file. SHA1 is only used because
+        # SPDX requires it for all file entries.
+        reader = tarball.extractfile(member)
+        assert reader, f"{member} is not a file in {tarball_path}"
+        file_bytes = reader.read()
+        actual_file_checksum_sha1 = hashlib.sha1(file_bytes).hexdigest()
+        actual_file_checksum_sha256 = hashlib.sha256(file_bytes).hexdigest()
+
+        # Remove the 'Python-{version}/...' prefix for the SPDXID and fileName.
+        member_name_no_prefix = member.name.split("/", 1)[1]
+
+        # We've already seen this file, so we check it hasn't been modified and continue on.
+        if member_name_no_prefix in known_sbom_files:
+            # If there's a hash mismatch we raise an error, something isn't right!
+            expected_file_checksum_sha256 = known_sbom_files.pop(member_name_no_prefix)
+            if expected_file_checksum_sha256 != actual_file_checksum_sha256:
+                raise ValueError(
+                    f"Mismatched checksum for file '{member_name_no_prefix}'"
+                )
+
+        # If this is a new file, then it's a part of the 'CPython' SBOM package.
+        else:
+            sbom_file_spdx_id = spdx_id(f"SPDXRef-FILE-{member_name_no_prefix}")
+            sbom_data["files"].append(
+                {
+                    "SPDXID": sbom_file_spdx_id,
+                    "fileName": member_name_no_prefix,
+                    "checksums": [
+                        {
+                            "algorithm": "SHA1",
+                            "checksumValue": actual_file_checksum_sha1,
+                        },
+                        {
+                            "algorithm": "SHA256",
+                            "checksumValue": actual_file_checksum_sha256,
+                        },
+                    ],
+                }
+            )
+            sbom_data["relationships"].append(
+                {
+                    "spdxElementId": sbom_cpython_package_spdx_id,
+                    "relatedSpdxElement": sbom_file_spdx_id,
+                    "relationshipType": "CONTAINS",
+                }
+            )
+
+    # If there are any known files that weren't found in the
+    # source tarball we want to raise an error.
+    if known_sbom_files:
+        raise ValueError(
+            f"Some files from source SBOM aren't accounted for "
+            f"in source tarball: {sorted(known_sbom_files)!r}"
+        )
+
+    # Final relationship, this SBOM describes the CPython package.
+    sbom_data["relationships"].append(
+        {
+            "spdxElementId": "SPDXRef-DOCUMENT",
+            "relatedSpdxElement": sbom_cpython_package_spdx_id,
+            "relationshipType": "DESCRIBES",
+        }
+    )
+
+    # Apply the 'supplier' tag to every package since we're shipping
+    # the package in the tarball itself. Originator field is used for maintainers.
+    for sbom_package in sbom_data["packages"]:
+        sbom_package["supplier"] = "Organization: Python Software Foundation"
+        sbom_package["filesAnalyzed"] = True
+
+    # Calculate the 'packageVerificationCode' values for files in packages.
+    calculate_package_verification_codes(sbom_data)
+
+    return sbom_data
+
+
+def create_sbom_for_windows_artifact(
+    artifact_path: str, cpython_source_dir: Path | str
+) -> SBOM:
+    artifact_name = os.path.basename(artifact_path)
+    if m := re.match(pat := r"^python-([0-9abrc.]+)t?(?:-|\.exe|\.zip)", artifact_name):
+        cpython_version = m.group(1)
+    else:
+        raise ValueError(f"Invalid {artifact_name=}, expected {pat!r}")
+
+    if not cpython_source_dir:
+        raise ValueError("Must specify --cpython-source-dir for Windows artifacts")
+    cpython_source_dir = Path(cpython_source_dir)
+
+    # Start with the CPython source SBOM as a base
+    with (cpython_source_dir / "Misc/externals.spdx.json").open() as f:
+        sbom_data: SBOM = json.loads(f.read())
+
+    sbom_data["relationships"] = []
+    sbom_data["files"] = []
+
+    # Add all the packages from the source SBOM
+    # We want to skip the file information because
+    # the files aren't available in Windows artifacts.
+    with (cpython_source_dir / "Misc/sbom.spdx.json").open() as f:
+        source_sbom_data = json.loads(f.read())
+        for sbom_package in source_sbom_data["packages"]:
+            # Update the SPDX ID to avoid collisions with
+            # the 'externals' SBOM.
+            sbom_package["SPDXID"] = spdx_id(
+                f"SPDXRef-PACKAGE-{sbom_package['name']}-{sbom_package['versionInfo']}"
+            )
+            sbom_data["packages"].append(sbom_package)
+
+    create_cpython_sbom(
+        sbom_data, cpython_version=cpython_version, artifact_path=artifact_path
+    )
+    sbom_cpython_package_spdx_id = spdx_id("SPDXRef-PACKAGE-cpython")
+
+    # The Windows embed artifacts don't contain pip/ensurepip,
+    # but the others do.
+    if "-embed" not in artifact_name:
+
+        # Find the pip wheel in ensurepip in the source code
+        for pathname in os.listdir(cpython_source_dir / "Lib/ensurepip/_bundled"):
+            if pathname.startswith("pip-") and pathname.endswith(".whl"):
+                pip_wheel_filename = pathname
+                pip_wheel_bytes = (
+                    cpython_source_dir / f"Lib/ensurepip/_bundled/{pathname}"
+                ).read_bytes()
+                break
+        else:
+            raise ValueError("Could not find pip wheel in 'Lib/ensurepip/_bundled/...'")
+
+        create_pip_sbom_from_wheel(
+            sbom_data,
+            pip_wheel_filename=pip_wheel_filename,
+            pip_wheel_bytes=pip_wheel_bytes,
+        )
+
+    # Final relationship, this SBOM describes the CPython package.
+    sbom_data["relationships"].append(
+        {
+            "spdxElementId": "SPDXRef-DOCUMENT",
+            "relatedSpdxElement": sbom_cpython_package_spdx_id,
+            "relationshipType": "DESCRIBES",
+        }
+    )
+
+    # Apply the 'supplier' tag to every package since we're shipping
+    # the package in the artifact itself. Originator field is used for maintainers.
+    for sbom_package in sbom_data["packages"]:
+        sbom_package["supplier"] = "Organization: Python Software Foundation"
+        # Source packages have been compiled.
+        if sbom_package["primaryPackagePurpose"] == "SOURCE":
+            sbom_package["primaryPackagePurpose"] = "LIBRARY"
+
+    return sbom_data
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cpython-source-dir", default=None)
+    parser.add_argument("artifacts", nargs="+")
+    parsed_args = parser.parse_args(sys.argv[1:])
+
+    artifact_paths = parsed_args.artifacts
+    cpython_source_dir = parsed_args.cpython_source_dir
+
+    for artifact_path in artifact_paths:
+        # Windows MSI and Embed artifacts
+        if artifact_path.endswith(".exe") or artifact_path.endswith(".zip"):
+            sbom_data = create_sbom_for_windows_artifact(
+                artifact_path, cpython_source_dir=cpython_source_dir
+            )
+        # Source artifacts
+        else:
+            sbom_data = create_sbom_for_source_tarball(artifact_path)
+
+        # Normalize SBOM data for reproducibility.
+        normalize_sbom_data(sbom_data)
+
+        # Check SBOM for validity.
+        check_sbom_data(sbom_data)
+
+        with open(artifact_path + ".spdx.json", mode="w") as f:
+            f.truncate()
+            f.write(json.dumps(sbom_data, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
+
+#!/usr/bin/env python3
+
+"""An automatic engine for Python releases
+
+Original code by Pablo Galindo
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import functools
+import getpass
+import json
+import os
+import re
+import shelve
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, cast
+
+import aiohttp
+import gnupg  # type: ignore[import-untyped]
+import paramiko
+import sigstore.oidc
+from alive_progress import alive_bar
+
+import release as release_mod
+import sbom
+import update_version_next
+from buildbotapi import BuildBotAPI, Builder
+from release import ReleaseShelf, Tag, Task, ask_question
+
+API_KEY_REGEXP = re.compile(r"(?P<user>\w+):(?P<key>\w+)")
+RELEASE_REGEXP = re.compile(
+    r"(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)\.?(?P<extra>.*)?"
+)
+DOWNLOADS_SERVER = "downloads.nyc1.psf.io"
+DOCS_SERVER = "docs.nyc1.psf.io"
+
+WHATS_NEW_TEMPLATE = """
+****************************
+  What's new in Python {version}
+****************************
+
+:Editor: TBD
+
+.. Rules for maintenance:
+
+   * Anyone can add text to this document.  Do not spend very much time
+   on the wording of your changes, because your text will probably
+   get rewritten to some degree.
+
+   * The maintainer will go through Misc/NEWS periodically and add
+   changes; it's therefore more important to add your changes to
+   Misc/NEWS than to this file.
+
+   * This is not a complete list of every single change; completeness
+   is the purpose of Misc/NEWS.  Some changes I consider too small
+   or esoteric to include.  If such a change is added to the text,
+   I'll just remove it.  (This is another reason you shouldn't spend
+   too much time on writing your addition.)
+
+   * If you want to draw your new text to the attention of the
+   maintainer, add 'XXX' to the beginning of the paragraph or
+   section.
+
+   * It's OK to just add a fragmentary note about a change.  For
+   example: "XXX Describe the transmogrify() function added to the
+   socket module."  The maintainer will research the change and
+   write the necessary text.
+
+   * You can comment out your additions if you like, but it's not
+   necessary (especially when a final release is some months away).
+
+   * Credit the author of a patch or bugfix.   Just the name is
+   sufficient; the e-mail address isn't necessary.
+
+   * It's helpful to add the issue number as a comment:
+
+   XXX Describe the transmogrify() function added to the socket
+   module.
+   (Contributed by P.Y. Developer in :gh:`12345`.)
+
+   This saves the maintainer the effort of going through the VCS log
+   when researching a change.
+
+This article explains the new features in Python {version}, compared to {prev_version}.
+
+For full details, see the :ref:`changelog <changelog>`.
+
+.. note::
+
+   Prerelease users should be aware that this document is currently in draft
+   form. It will be updated substantially as Python {version} moves towards release,
+   so it's worth checking back even after reading earlier versions.
+
+
+Summary --- release highlights
+==============================
+
+.. This section singles out the most important changes in Python {version}.
+   Brevity is key.
+
+
+.. PEP-sized items next.
+
+
+
+New features
+============
+
+
+
+Other language changes
+======================
+
+
+
+New modules
+===========
+
+* None yet.
+
+
+Improved modules
+================
+
+module_name
+-----------
+
+* TODO
+
+.. Add improved modules above alphabetically, not here at the end.
+
+Optimizations
+=============
+
+module_name
+-----------
+
+* TODO
+
+
+
+Removed
+=======
+
+module_name
+-----------
+
+* TODO
+.. Add removals above alphabetically, not here at the end.
+
+
+Deprecated
+==========
+
+* module_name:
+  TODO
+
+
+.. Add deprecations above alphabetically, not here at the end.
+
+
+Porting to Python {version}
+======================
+
+This section lists previously described changes and other bugfixes
+that may require changes to your code.
+
+
+Build changes
+=============
+
+
+C API changes
+=============
+
+New features
+------------
+
+* TODO
+
+Porting to Python {version}
+----------------------
+
+* TODO
+
+Deprecated C APIs
+-----------------
+
+* TODO
+
+.. Add C API deprecations above alphabetically, not here at the end.
+
+Removed C APIs
+--------------
+
+"""
+
+
+class ReleaseException(Exception):
+    """An error happened in the release process"""
+
+
+class ReleaseDriver:
+    def __init__(
+        self,
+        tasks: list[Task],
+        *,
+        release_tag: Tag,
+        git_repo: str,
+        api_key: str,
+        ssh_user: str,
+        sign_gpg: bool,
+        ssh_key: str | None = None,
+        first_state: Task | None = None,
+    ) -> None:
+        self.tasks = tasks
+        dbfile = Path.home() / f".python_release-{release_tag}"
+        self.db: ReleaseShelf = cast(ReleaseShelf, shelve.open(str(dbfile), "c"))
+        if not self.db.get("finished"):
+            self.db["finished"] = False
+        else:
+            self.db.close()
+            self.db = cast(ReleaseShelf, shelve.open(str(dbfile), "n"))
+
+        self.current_task: Task | None = first_state
+        self.completed_tasks = self.db.get("completed_tasks", [])
+        self.remaining_tasks = iter(tasks[len(self.completed_tasks) :])
+        if self.db.get("gpg_key"):
+            os.environ["GPG_KEY_FOR_RELEASE"] = self.db["gpg_key"]
+        if not self.db.get("git_repo"):
+            self.db["git_repo"] = Path(git_repo)
+        if not self.db.get("auth_info"):
+            self.db["auth_info"] = api_key
+        if not self.db.get("ssh_user"):
+            self.db["ssh_user"] = ssh_user
+        if not self.db.get("ssh_key"):
+            self.db["ssh_key"] = ssh_key
+        if not self.db.get("sign_gpg"):
+            self.db["sign_gpg"] = sign_gpg
+        if not self.db.get("release"):
+            self.db["release"] = release_tag
+        if not self.db.get("security_release"):
+            self.db["security_release"] = self.db["release"].is_security_release
+
+        print("Release data: ")
+        print(f"- Branch: {release_tag.branch}")
+        print(f"- Release tag: {self.db['release']}")
+        print(f"- Normalized release tag: {release_tag.normalized()}")
+        print(f"- Git repo: {self.db['git_repo']}")
+        print(f"- SSH username: {self.db['ssh_user']}")
+        print(f"- SSH key: {self.db['ssh_key'] or 'Default'}")
+        print(f"- Sign with GPG: {self.db['sign_gpg']}")
+        print(f"- Security release: {self.db['security_release']}")
+        print()
+
+    def checkpoint(self) -> None:
+        self.db["completed_tasks"] = self.completed_tasks
+
+    def run(self) -> None:
+        for task in self.completed_tasks:
+            print(f"✅  {task.description}")
+
+        self.current_task = next(self.remaining_tasks, None)
+        while self.current_task is not None:
+            self.checkpoint()
+            try:
+                self.current_task(self.db)
+            except Exception as e:
+                print(f"\r💥  {self.current_task.description}")
+                raise e from None
+            print(f"\r✅  {self.current_task.description}")
+            self.completed_tasks.append(self.current_task)
+            self.current_task = next(self.remaining_tasks, None)
+        self.db["finished"] = True
+        print()
+        print(f"Congratulations, Python {self.db['release']} is released 🎉🎉🎉")
+
+
+@contextlib.contextmanager
+def cd(path: Path) -> Iterator[None]:
+    current_path = os.getcwd()
+    os.chdir(path)
+    yield
+    os.chdir(current_path)
+
+
+def check_tool(db: ReleaseShelf, tool: str) -> None:
+    if shutil.which(tool) is None:
+        raise ReleaseException(f"{tool} is not available")
+
+
+check_gh = functools.partial(check_tool, tool="gh")
+check_git = functools.partial(check_tool, tool="git")
+check_make = functools.partial(check_tool, tool="make")
+check_blurb = functools.partial(check_tool, tool="blurb")
+check_autoconf = functools.partial(check_tool, tool="autoconf")
+check_docker = functools.partial(check_tool, tool="docker")
+
+
+def check_gpg_keys(db: ReleaseShelf) -> None:
+    pg = gnupg.GPG()
+    keys = pg.list_keys(secret=True)
+    if not keys:
+        raise ReleaseException("There are no valid GPG keys for release")
+    for index, key in enumerate(keys):
+        print(f"{index} - {key['keyid']}: {key['uids']}")
+    selected_key_index = -1
+    while not (0 <= selected_key_index < len(keys)):
+        with contextlib.suppress(ValueError):
+            selected_key_index = int(
+                input("Select one GPG key for release (by index):")
+            )
+    selected_key = keys[selected_key_index]["keyid"]
+    os.environ["GPG_KEY_FOR_db['release']"] = selected_key
+    if selected_key not in {key["keyid"] for key in keys}:
+        raise ReleaseException("Invalid GPG key selected")
+    db["gpg_key"] = selected_key
+    os.environ["GPG_KEY_FOR_RELEASE"] = db["gpg_key"]
+
+
+def check_ssh_connection(db: ReleaseShelf) -> None:
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.RejectPolicy)
+    client.connect(
+        DOWNLOADS_SERVER, port=22, username=db["ssh_user"], key_filename=db["ssh_key"]
+    )
+    client.exec_command("pwd")
+    client.connect(
+        DOCS_SERVER, port=22, username=db["ssh_user"], key_filename=db["ssh_key"]
+    )
+    client.exec_command("pwd")
+
+
+def check_sigstore_client(db: ReleaseShelf) -> None:
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.RejectPolicy)
+    client.connect(
+        DOWNLOADS_SERVER, port=22, username=db["ssh_user"], key_filename=db["ssh_key"]
+    )
+    _, stdout, _ = client.exec_command("python3 -m sigstore --version")
+    sigstore_version = stdout.read(1000).decode()
+    check_sigstore_version(sigstore_version)
+
+
+def check_sigstore_version(version: str) -> None:
+    version_match = re.match("^sigstore ([0-9.]+)", version)
+    if version_match:
+        version_tuple = tuple(int(part) for part in version_match.group(1).split("."))
+        if (3, 6, 2) <= version_tuple < (4, 0):
+            # good version
+            return
+
+    raise ReleaseException(
+        f"Sigstore version not detected or not valid. "
+        f"Expecting >= 3.6.2 and < 4.0.0, got: {version}"
+    )
+
+
+def check_buildbots(db: ReleaseShelf) -> None:
+    async def _check() -> set[Builder]:
+        async def _get_builder_status(
+            buildbot_api: BuildBotAPI, the_builder: Builder
+        ) -> tuple[Builder, bool]:
+            return the_builder, await buildbot_api.is_builder_failing_currently(
+                the_builder
+            )
+
+        async with aiohttp.ClientSession() as session:
+            api = BuildBotAPI(session)
+            await api.authenticate(token="")
+            release_branch = db["release"].branch
+            stable_builders = await api.stable_builders(branch=release_branch)
+            if not stable_builders:
+                release_branch = "3.x"
+                stable_builders = await api.stable_builders(branch="3.x")
+            if not stable_builders:
+                raise ReleaseException(
+                    f"Failed to get the stable buildbots for the {release_branch} tag"
+                )
+            builders = await asyncio.gather(
+                *[
+                    _get_builder_status(api, the_builder)
+                    for the_builder in stable_builders.values()
+                ]
+            )
+            return {the_builder for (the_builder, is_failing) in builders if is_failing}
+
+    failing_builders = asyncio.run(_check())
+    if not failing_builders:
+        return
+    print()
+    print("The following buildbots are failing:")
+    for builder in failing_builders:
+        print(f"- {builder.name}")
+    print()
+    print("Check https://buildbot.python.org/all/#/release_status for more information")
+    print()
+    if not ask_question("Do you want to continue even if these builders are failing?"):
+        raise ReleaseException("Buildbots are failing!")
+
+
+def check_docker_running(db: ReleaseShelf) -> None:
+    subprocess.check_call(["docker", "container", "ls"])
+
+
+def run_blurb_release(db: ReleaseShelf) -> None:
+    subprocess.check_call(["blurb", "release", str(db["release"])], cwd=db["git_repo"])
+    subprocess.check_call(
+        ["git", "commit", "-m", f"Python {db['release']}"],
+        cwd=db["git_repo"],
+    )
+
+
+def check_cpython_repo_branch(db: ReleaseShelf) -> None:
+    current_branch = subprocess.check_output(
+        shlex.split("git branch --show-current"), text=True, cwd=db["git_repo"]
+    ).strip()
+    expected_branch = db["release"].branch
+    if current_branch != expected_branch:
+        raise ReleaseException(
+            f"CPython repository is on {current_branch} branch, "
+            f"expected {expected_branch}"
+        )
+
+
+def check_cpython_repo_age(db: ReleaseShelf) -> None:
+    # %ct = committer date, UNIX timestamp (for example, "1768300016")
+    timestamp = subprocess.check_output(
+        shlex.split('git log -1 --format="%ct"'), text=True, cwd=db["git_repo"]
+    ).strip()
+    age_seconds = time.time() - int(timestamp.strip())
+    is_old = age_seconds > 86400  # 1 day
+
+    # cr = committer date, relative (for example, "3 days ago")
+    out = subprocess.check_output(
+        shlex.split('git log -1 --format="%cr"'), text=True, cwd=db["git_repo"]
+    )
+    print(f"Last CPython commit was {out.strip()}")
+
+    if is_old and not ask_question("Continue with old repo?"):
+        raise ReleaseException("CPython repository is old")
+
+
+def check_cpython_repo_is_clean(db: ReleaseShelf) -> None:
+    if subprocess.check_output(["git", "status", "--porcelain"], cwd=db["git_repo"]):
+        raise ReleaseException("Git repository is not clean")
+
+
+def check_magic_number(db: ReleaseShelf) -> None:
+    release_tag = db["release"]
+    if release_tag.is_final or release_tag.is_release_candidate:
+
+        def out(msg: str) -> None:
+            raise ReleaseException(msg)
+
+    else:
+
+        def out(msg: str) -> None:
+            print("warning:", msg, file=sys.stderr, flush=True)
+
+    def get_magic(source: Path, regex: re.Pattern[str]) -> str:
+        if m := regex.search(source.read_text()):
+            return m.group("magic")
+
+        out(f"Cannot find magic in {source}, tried {regex.pattern}")
+        return "unknown"
+
+    work_dir = Path(db["git_repo"])
+    magic_actual_file = work_dir / "Include" / "internal" / "pycore_magic_number.h"
+    magic_actual_re = re.compile(
+        r"^#define\s+PYC_MAGIC_NUMBER\s+(?P<magic>\d+)$", re.MULTILINE
+    )
+    magic_actual = get_magic(magic_actual_file, magic_actual_re)
+
+    magic_expected_file = work_dir / "Lib" / "test" / "test_importlib" / "test_util.py"
+    magic_expected_re = re.compile(
+        r"^\s+EXPECTED_MAGIC_NUMBER = (?P<magic>\d+)$", re.MULTILINE
+    )
+    magic_expected = get_magic(magic_expected_file, magic_expected_re)
+
+    if magic_actual == magic_expected:
+        return
+
+    out(
+        f"Magic numbers in {magic_actual_file} ({magic_actual})"
+        f" and {magic_expected_file} ({magic_expected}) don't match."
+    )
+    if not ask_question("Do you want to continue? This will fail tests in RC stage."):
+        raise ReleaseException("Magic numbers don't match!")
+
+
+def prepare_temporary_branch(db: ReleaseShelf) -> None:
+    subprocess.check_call(
+        ["git", "checkout", "-b", f"branch-{db['release']}"], cwd=db["git_repo"]
+    )
+
+
+def remove_temporary_branch(db: ReleaseShelf) -> None:
+    subprocess.check_call(
+        ["git", "branch", "-D", f"branch-{db['release']}"], cwd=db["git_repo"]
+    )
+
+
+def prepare_pydoc_topics(db: ReleaseShelf) -> None:
+    subprocess.check_call(["make", "venv"], cwd=db["git_repo"] / "Doc")
+    subprocess.check_call(["make", "pydoc-topics"], cwd=db["git_repo"] / "Doc")
+    shutil.copy2(
+        db["git_repo"] / "Doc" / "build" / "pydoc-topics" / "topics.py",
+        db["git_repo"] / "Lib" / "pydoc_data" / "topics.py",
+    )
+    if db["release"].as_tuple() >= (3, 13):
+        shutil.copy2(
+            db["git_repo"] / "Doc" / "build" / "pydoc-topics" / "module_docs.py",
+            db["git_repo"] / "Lib" / "pydoc_data" / "module_docs.py",
+        )
+    subprocess.check_call(
+        ["git", "commit", "-a", "--amend", "--no-edit"], cwd=db["git_repo"]
+    )
+
+
+def run_autoconf(db: ReleaseShelf) -> None:
+    # Python 3.12 and newer have a script that runs autoconf.
+    regen_configure_sh = db["git_repo"] / "Tools/build/regen-configure.sh"
+    if regen_configure_sh.exists():
+        subprocess.check_call(
+            [regen_configure_sh],
+            cwd=db["git_repo"],
+        )
+    # Python 3.11 and prior rely on autoconf built within a container
+    # in order to maintain stability of autoconf generation.
+    else:
+        # Corresponds to the tag '269' and 'cp311'
+        cpython_autoconf_sha256 = (
+            "f370fee95eefa3d57b00488bce4911635411fa83e2d293ced8cf8a3674ead939"
+        )
+        subprocess.check_call(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--pull=always",
+                f"-v{db['git_repo']}:/src",
+                f"quay.io/tiran/cpython_autoconf@sha256:{cpython_autoconf_sha256}",
+            ],
+            cwd=db["git_repo"],
+        )
+        subprocess.check_call(["docker", "rmi", "quay.io/tiran/cpython_autoconf", "-f"])
+
+    subprocess.check_call(
+        ["git", "commit", "-a", "--amend", "--no-edit"], cwd=db["git_repo"]
+    )
+
+
+def check_pyspecific(db: ReleaseShelf) -> None:
+    with open(
+        db["git_repo"] / "Doc" / "tools" / "extensions" / "pyspecific.py"
+    ) as pyspecific:
+        for line in pyspecific:
+            if "SOURCE_URI =" in line:
+                break
+    expected_branch = db["release"].branch
+    expected = (
+        f"SOURCE_URI = 'https://github.com/python/cpython/tree/{expected_branch}/%s'"
+    )
+    if expected != line.strip():
+        raise ReleaseException(
+            f"SOURCE_URI is incorrect (it needs changing before beta 1):\n"
+            f"expected: {expected}\n"
+            f"got     : {line.strip()}"
+        )
+
+
+def bump_version(db: ReleaseShelf) -> None:
+    with cd(db["git_repo"]):
+        release_mod.bump(db["release"])
+    subprocess.check_call(
+        ["git", "commit", "-a", "--amend", "--no-edit"], cwd=db["git_repo"]
+    )
+
+
+def bump_version_in_docs(db: ReleaseShelf) -> None:
+    update_version_next.main([db["release"].doc_version, str(db["git_repo"])])
+    subprocess.check_call(
+        ["git", "commit", "-a", "--amend", "--no-edit"], cwd=db["git_repo"]
+    )
+
+
+def create_tag(db: ReleaseShelf) -> None:
+    with cd(db["git_repo"]):
+        if not release_mod.make_tag(db["release"], sign_gpg=db["sign_gpg"]):
+            raise ReleaseException("Error when creating tag")
+    subprocess.check_call(
+        ["git", "commit", "-a", "--amend", "--no-edit"], cwd=db["git_repo"]
+    )
+
+
+def wait_for_build_release(db: ReleaseShelf) -> None:
+    # Determine if we need to wait for docs.
+    release_tag = db["release"]
+    should_wait_for_docs = release_tag.includes_docs
+
+    # Create the directory so it's easier to place the artifacts there.
+    release_path = Path(db["git_repo"] / str(release_tag))
+    downloads_path = release_path / "downloads"
+    downloads_path.mkdir(parents=True, exist_ok=True)
+
+    # Build the list of filepaths we're expecting.
+    wait_for_paths = [
+        downloads_path / f"Python-{release_tag}.tgz",
+        downloads_path / f"Python-{release_tag}.tar.xz",
+    ]
+    if release_tag.as_tuple() >= (3, 14):
+        wait_for_paths += [
+            downloads_path / f"python-{release_tag}-{arch}-linux-android.tar.gz"
+            for arch in ["aarch64", "x86_64"]
+        ]
+    if should_wait_for_docs:
+        docs_path = release_path / "docs"
+        docs_path.mkdir(parents=True, exist_ok=True)
+        wait_for_paths.extend(
+            [
+                docs_path / f"python-{release_tag}-docs.epub",
+                docs_path / f"python-{release_tag}-docs-html.tar.bz2",
+                docs_path / f"python-{release_tag}-docs-html.zip",
+                docs_path / f"python-{release_tag}-docs-texinfo.tar.bz2",
+                docs_path / f"python-{release_tag}-docs-texinfo.zip",
+                docs_path / f"python-{release_tag}-docs-text.tar.bz2",
+                docs_path / f"python-{release_tag}-docs-text.zip",
+            ]
+        )
+
+    print("Once the build-release workflow is complete:")
+    print("- Download its artifacts from the workflow summary page.")
+    print(f"- Copy the following files into {release_path}:")
+    for path in wait_for_paths:
+        print(f"  - {os.path.relpath(path, release_path)}")
+    print("The script will continue once all files are present.")
+
+    while not all(path.exists() for path in wait_for_paths):
+        time.sleep(1)
+
+
+def check_doc_unreleased_version(db: ReleaseShelf) -> None:
+    print("Checking built docs for '(unreleased)'")
+    # This string is generated when a `versionadded:: next` directive is
+    # left in the docs, which means the `bump_version_in_docs` step
+    # didn't do its job.
+    # But, there could also be a false positive.
+    release_tag = db["release"]
+    docs_path = Path(db["git_repo"]) / str(release_tag) / "docs"
+    archive_path = docs_path / f"python-{release_tag}-docs-html.tar.bz2"
+    if release_tag.includes_docs:
+        assert archive_path.exists()
+    if archive_path.exists():
+        with tempfile.TemporaryDirectory() as temp_dir:
+            subprocess.run(["tar", "-xjf", archive_path, "-C", temp_dir])
+            proc = subprocess.run(["grep", "-rHn", "[(]unreleased[)]", temp_dir])
+            if proc.returncode == 0:
+                if not ask_question(
+                    "Are these `(unreleased)` strings in built docs OK?"
+                ):
+                    raise AssertionError("`(unreleased)` strings found in docs")
+
+
+def sign_source_artifacts(db: ReleaseShelf) -> None:
+    print("Signing tarballs with GPG")
+    uid = os.environ.get("GPG_KEY_FOR_RELEASE")
+    if not uid:
+        print("List of available private keys:")
+        subprocess.check_call('gpg -K | grep -A 1 "^sec"', shell=True)
+        uid = input("Please enter key ID to use for signing: ")
+
+    tarballs_path = Path(db["git_repo"] / str(db["release"]) / "downloads")
+    tgz = str(tarballs_path / f"Python-{db['release']}.tgz")
+    xz = str(tarballs_path / f"Python-{db['release']}.tar.xz")
+
+    subprocess.check_call(["gpg", "-bas", "-u", uid, tgz])
+    subprocess.check_call(["gpg", "-bas", "-u", uid, xz])
+
+    print("Signing tarballs with Sigstore")
+    for filename in (tgz, xz):
+        cert_file = filename + ".crt"
+        sig_file = filename + ".sig"
+        bundle_file = filename + ".sigstore"
+
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-m",
+                "sigstore",
+                "sign",
+                "--oidc-disable-ambient-providers",
+                "--signature",
+                sig_file,
+                "--certificate",
+                cert_file,
+                "--bundle",
+                bundle_file,
+                filename,
+            ]
+        )
+
+
+def build_sbom_artifacts(db: ReleaseShelf) -> None:
+
+    # Skip building an SBOM if there isn't a 'Misc/sbom.spdx.json' file.
+    if not (db["git_repo"] / "Misc/sbom.spdx.json").exists():
+        print("Skipping building an SBOM, missing 'Misc/sbom.spdx.json'")
+        return
+
+    release_version = db["release"]
+    # For each source tarball build an SBOM.
+    for ext in (".tgz", ".tar.xz"):
+        tarball_name = f"Python-{release_version}{ext}"
+        tarball_path = str(
+            db["git_repo"] / str(db["release"]) / "downloads" / tarball_name
+        )
+
+        print(f"Building an SBOM for artifact '{tarball_name}'")
+        sbom_data = sbom.create_sbom_for_source_tarball(tarball_path)
+
+        with open(tarball_path + ".spdx.json", mode="w") as f:
+            f.write(json.dumps(sbom_data, indent=2, sort_keys=True))
+
+
+class MySFTPClient(paramiko.SFTPClient):
+    def put_dir(
+        self, source: str | Path, target: str | Path, progress: Any = None
+    ) -> None:
+        for item in os.listdir(source):
+            if os.path.isfile(os.path.join(source, item)):
+                progress.text(item)
+                self.put(os.path.join(source, item), f"{target}/{item}")
+                progress()
+            else:
+                self.mkdir(f"{target}/{item}", ignore_existing=True)
+                self.put_dir(
+                    os.path.join(source, item),
+                    f"{target}/{item}",
+                    progress=progress,
+                )
+
+    def mkdir(
+        self, path: bytes | str, mode: int = 511, ignore_existing: bool = False
+    ) -> None:
+        try:
+            super().mkdir(path, mode)
+        except OSError:
+            if ignore_existing:
+                pass
+            else:
+                raise
+
+
+def upload_files_to_server(db: ReleaseShelf, server: str) -> None:
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.RejectPolicy)
+    client.connect(server, port=22, username=db["ssh_user"], key_filename=db["ssh_key"])
+    transport = client.get_transport()
+    assert transport is not None, f"SSH transport to {server} is None"
+
+    destination = Path(f"/home/psf-users/{db['ssh_user']}/{db['release']}")
+    ftp_client = MySFTPClient.from_transport(transport)
+    assert ftp_client is not None, f"SFTP client to {server} is None"
+
+    client.exec_command(f"rm -rf {destination}")
+
+    with contextlib.suppress(OSError):
+        ftp_client.mkdir(str(destination))
+
+    artifacts_path = Path(db["git_repo"] / str(db["release"]))
+
+    shutil.rmtree(artifacts_path / f"Python-{db['release']}", ignore_errors=True)
+
+    def upload_subdir(subdir: str) -> None:
+        with contextlib.suppress(OSError):
+            ftp_client.mkdir(str(destination / subdir))
+        with alive_bar(len(tuple((artifacts_path / subdir).glob("**/*")))) as progress:
+            ftp_client.put_dir(
+                artifacts_path / subdir,
+                str(destination / subdir),
+                progress=progress,
+            )
+
+    if server == DOCS_SERVER:
+        upload_subdir("docs")
+    elif server == DOWNLOADS_SERVER:
+        upload_subdir("downloads")
+        if (artifacts_path / "docs").exists():
+            upload_subdir("docs")
+
+    ftp_client.close()
+
+
+def upload_files_to_downloads_server(db: ReleaseShelf) -> None:
+    upload_files_to_server(db, DOWNLOADS_SERVER)
+
+
+def place_files_in_download_folder(db: ReleaseShelf) -> None:
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.RejectPolicy)
+    client.connect(
+        DOWNLOADS_SERVER, port=22, username=db["ssh_user"], key_filename=db["ssh_key"]
+    )
+    transport = client.get_transport()
+    assert transport is not None, f"SSH transport to {DOWNLOADS_SERVER} is None"
+
+    # Downloads
+
+    source = f"/home/psf-users/{db['ssh_user']}/{db['release']}"
+    destination = f"/srv/www.python.org/ftp/python/{db['release'].normalized()}"
+
+    def execute_command(command: str) -> None:
+        channel = transport.open_session()
+        channel.exec_command(command)
+        if channel.recv_exit_status() != 0:
+            raise ReleaseException(channel.recv_stderr(1000))
+
+    execute_command(f"mkdir -p {destination}")
+    execute_command(f"cp {source}/downloads/* {destination}")
+    execute_command(f"chgrp downloads {destination}")
+    execute_command(f"chmod 775 {destination}")
+    execute_command(f"find {destination} -type f -exec chmod 664 {{}} \\;")
+
+    # Docs
+
+    release_tag = db["release"]
+    if release_tag.is_final or release_tag.is_release_candidate:
+        source = f"/home/psf-users/{db['ssh_user']}/{db['release']}"
+        destination = f"/srv/www.python.org/ftp/python/doc/{release_tag}"
+
+        execute_command(f"mkdir -p {destination}")
+        execute_command(f"cp {source}/docs/* {destination}")
+        execute_command(f"chgrp downloads {destination}")
+        execute_command(f"chmod 775 {destination}")
+        execute_command(f"find {destination} -type f -exec chmod 664 {{}} \\;")
+
+
+def upload_docs_to_the_docs_server(db: ReleaseShelf) -> None:
+    release_tag: release_mod.Tag = db["release"]
+    if not (release_tag.is_final or release_tag.is_release_candidate):
+        return
+
+    upload_files_to_server(db, DOCS_SERVER)
+
+
+def unpack_docs_in_the_docs_server(db: ReleaseShelf) -> None:
+    release_tag: release_mod.Tag = db["release"]
+    if not (release_tag.is_final or release_tag.is_release_candidate):
+        return
+
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.RejectPolicy)
+    client.connect(
+        DOCS_SERVER, port=22, username=db["ssh_user"], key_filename=db["ssh_key"]
+    )
+    transport = client.get_transport()
+    assert transport is not None, f"SSH transport to {DOCS_SERVER} is None"
+
+    # Sources
+
+    source = f"/home/psf-users/{db['ssh_user']}/{db['release']}"
+    destination = f"/srv/docs.python.org/release/{release_tag}"
+
+    def execute_command(command: str) -> None:
+        channel = transport.open_session()
+        channel.exec_command(command)
+        if channel.recv_exit_status() != 0:
+            raise ReleaseException(channel.recv_stderr(1000))
+
+    docs_filename = f"python-{release_tag}-docs-html"
+    execute_command(f"mkdir -p {destination}")
+    execute_command(f"unzip {source}/docs/{docs_filename}.zip -d {destination}")
+    execute_command(f"mv /{destination}/{docs_filename}/* {destination}")
+    execute_command(f"rm -rf /{destination}/{docs_filename}")
+    execute_command(f"chgrp -R docs {destination}")
+    execute_command(f"chmod -R 775 {destination}")
+    execute_command(f"find {destination} -type f -exec chmod 664 {{}} \\;")
+
+
+@functools.cache
+def extract_github_owner(url: str) -> str:
+    if https_match := re.match(r"(https://)?github\.com/([^/]+)/", url):
+        return https_match.group(2)
+    elif ssh_match := re.match(r"^git@github\.com:([^/]+)/", url):
+        return ssh_match.group(1)
+    else:
+        raise ReleaseException(
+            f"Could not parse GitHub owner from 'origin' remote URL: {url}"
+        )
+
+
+@functools.cache
+def get_commit_sha(git_version: str, git_repo: Path) -> str:
+    """Get the Git commit SHA for the tag"""
+    commit_sha = (
+        subprocess.check_output(
+            ["git", "rev-list", "-n", "1", git_version], cwd=git_repo
+        )
+        .decode()
+        .strip()
+    )
+    return commit_sha
+
+
+@functools.cache
+def get_origin_remote_url(git_repo: Path) -> str:
+    """Get the owner of the GitHub repo (first path segment in a 'github.com' remote URL)
+    This works for both 'https' and 'ssh' style remote URLs."""
+    origin_remote_url = (
+        subprocess.check_output(
+            ["git", "ls-remote", "--get-url", "origin"], cwd=git_repo
+        )
+        .decode()
+        .strip()
+    )
+    return origin_remote_url
+
+
+def start_build_release(db: ReleaseShelf) -> None:
+    commit_sha = get_commit_sha(db["release"].gitname, db["git_repo"])
+    origin_remote_url = get_origin_remote_url(db["git_repo"])
+    origin_remote_github_owner = extract_github_owner(origin_remote_url)
+    # We ask for human verification at this point since this commit SHA is 'locked in'
+    print()
+    print(
+        f"Go to https://github.com/{origin_remote_github_owner}/cpython/commit/{commit_sha}"
+    )
+    print("- Ensure that the commit diff does not contain any unexpected changes.")
+    print(
+        "- For the next step, ensure the commit SHA matches the one you verified on GitHub in this step."
+    )
+    print()
+    if not ask_question(
+        "Have you verified the release commit hasn't been tampered with on GitHub?"
+    ):
+        raise ReleaseException("Commit must be visually reviewed before starting build")
+
+    # After visually confirming the release manager can start the build process
+    # with the known good commit SHA.
+    print()
+    cmd = (
+        "gh workflow run build-release.yml --repo python/release-tools"
+        f" -f git_remote={origin_remote_github_owner}"
+        f" -f git_commit={commit_sha}"
+        f" -f cpython_release={db['release']}"
+    )
+    subprocess.check_call(shlex.split(cmd))
+    print(
+        "Go to https://github.com/python/release-tools/actions/workflows/build-release.yml"
+    )
+    print()
+
+    if not ask_question("Have you started the build-release workflow?"):
+        raise ReleaseException("build-release workflow must be started")
+
+
+def send_email_to_platform_release_managers(db: ReleaseShelf) -> None:
+    commit_sha = get_commit_sha(db["release"].gitname, db["git_repo"])
+    origin_remote_url = get_origin_remote_url(db["git_repo"])
+    origin_remote_github_owner = extract_github_owner(origin_remote_url)
+    github_prefix = f"https://github.com/{origin_remote_github_owner}/cpython/tree"
+
+    print()
+    print(f"{github_prefix}/{db['release'].gitname}")
+    print(f"Git commit SHA: {commit_sha}")
+    print(
+        "build-release workflow: https://github.com/python/release-tools/actions/runs/[ENTER-RUN-ID-HERE]"
+    )
+    print()
+
+    if not ask_question(
+        "Have you notified the platform release managers about the availability of the commit SHA and tag?"
+    ):
+        raise ReleaseException("Platform release managers must be notified")
+
+
+def create_release_object_in_db(db: ReleaseShelf) -> None:
+    print(
+        "Go to https://www.python.org/admin/downloads/release/add/ and create a new release"
+    )
+    if not ask_question(f"Have you already created a new release for {db['release']}?"):
+        raise ReleaseException("The Django release object has not been created")
+
+
+def wait_until_all_files_are_in_folder(db: ReleaseShelf) -> None:
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.RejectPolicy)
+    client.connect(
+        DOWNLOADS_SERVER, port=22, username=db["ssh_user"], key_filename=db["ssh_key"]
+    )
+    ftp_client = client.open_sftp()
+
+    destination = f"/srv/www.python.org/ftp/python/{db['release'].normalized()}"
+
+    are_all_files_there = False
+    release = str(db["release"])
+    print()
+    while not are_all_files_there:
+        try:
+            all_files = set(ftp_client.listdir(destination))
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"The release folder in {destination} has not been created"
+            ) from None
+        are_windows_files_there = f"python-{release}.exe" in all_files
+        are_macos_files_there = f"python-{release}-macos11.pkg" in all_files
+        are_linux_files_there = f"Python-{release}.tgz" in all_files
+
+        if db["security_release"]:
+            # For security releases, only check Linux files
+            are_all_files_there = are_linux_files_there
+        else:
+            # For regular releases, check all platforms
+            are_all_files_there = (
+                are_linux_files_there
+                and are_windows_files_there
+                and are_macos_files_there
+            )
+
+        if not are_all_files_there:
+            linux_tick = "✅" if are_linux_files_there else "❌"
+            windows_tick = "✅" if are_windows_files_there else "❌"
+            macos_tick = "✅" if are_macos_files_there else "❌"
+
+            if db["security_release"]:
+                waiting = f"\rWaiting for files: Linux {linux_tick} (security release - only checking Linux)"
+            else:
+                waiting = f"\rWaiting for files: Linux {linux_tick}  Windows {windows_tick}  Mac {macos_tick} "
+
+            print(waiting, flush=True, end="")
+            time.sleep(1)
+    print()
+
+
+def run_add_to_python_dot_org(db: ReleaseShelf) -> None:
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.RejectPolicy)
+    client.connect(
+        DOWNLOADS_SERVER, port=22, username=db["ssh_user"], key_filename=db["ssh_key"]
+    )
+    transport = client.get_transport()
+    assert transport is not None, f"SSH transport to {DOWNLOADS_SERVER} is None"
+
+    # Ensure the file is there
+    source = Path(__file__).parent / "add_to_pydotorg.py"
+    destination = Path(f"/home/psf-users/{db['ssh_user']}/add_to_pydotorg.py")
+    ftp_client = MySFTPClient.from_transport(transport)
+    assert ftp_client is not None, f"SFTP client to {DOWNLOADS_SERVER} is None"
+    ftp_client.put(str(source), str(destination))
+    ftp_client.close()
+
+    auth_info = db["auth_info"]
+    assert auth_info is not None
+
+    # Do the interactive flow to get an identity for Sigstore
+    issuer = sigstore.oidc.Issuer(sigstore.oidc.DEFAULT_OAUTH_ISSUER_URL)
+    identity_token = issuer.identity_token()
+
+    print("Adding files to python.org...")
+    stdin, stdout, stderr = client.exec_command(
+        f"AUTH_INFO={auth_info} SIGSTORE_IDENTITY_TOKEN={identity_token} python3 add_to_pydotorg.py {db['release']}"
+    )
+    stderr_text = stderr.read().decode()
+    if stderr_text:
+        raise paramiko.SSHException(f"Failed to execute the command: {stderr_text}")
+    stdout_text = stdout.read().decode()
+    print("-- Command output --")
+    print(stdout_text)
+    print("-- End of command output --")
+
+
+def purge_the_cdn(db: ReleaseShelf) -> None:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows; U; Windows NT 6.1; en-US; rv:1.9.1.6) Gecko/20091201 Firefox/3.5.6"
+    }
+    normalized_release = db["release"].normalized()
+    urls = [
+        f"https://www.python.org/downloads/release/python-{str(db['release']).replace('.', '')}/",
+        f"https://docs.python.org/release/{db['release']}/",
+        f"https://www.python.org/ftp/python/{normalized_release}/",
+        f"https://docs.python.org/release/{normalized_release}/",
+        "https://www.python.org/downloads/",
+        "https://www.python.org/downloads/windows/",
+        "https://www.python.org/downloads/macos/",
+    ]
+    # Purge the source URLs and their associated metadata files.
+    source_urls = [
+        f"https://www.python.org/ftp/python/{normalized_release}/Python-{db['release']}.tgz",
+        f"https://www.python.org/ftp/python/{normalized_release}/Python-{db['release']}.tar.xz",
+    ]
+    for source_url in source_urls:
+        urls.extend(
+            [
+                f"{source_url}",
+                f"{source_url}.asc",
+                f"{source_url}.crt",
+                f"{source_url}.sig",
+                f"{source_url}.sigstore",
+                f"{source_url}.spdx.json",
+            ]
+        )
+
+    for url in urls:
+        req = urllib.request.Request(url=url, headers=headers, method="PURGE")
+        # try:
+        response = urllib.request.urlopen(req)
+        if response.code != 200:
+            raise RuntimeError("Failed to purge the python.org/downloads CDN")
+
+
+def announce_release(db: ReleaseShelf) -> None:
+    if not ask_question(
+        "Have you announced the release at https://discuss.python.org/c/core-dev/23 "
+        "and https://www.blogger.com?\n"
+        "Tip: use the 'release' tag and 'releases' label respectively."
+    ):
+        raise ReleaseException("The release has not been announced")
+
+
+def post_release_merge(db: ReleaseShelf) -> None:
+    subprocess.check_call(
+        ["git", "fetch", "--all"],
+        cwd=db["git_repo"],
+    )
+
+    release_tag: release_mod.Tag = db["release"]
+    if release_tag.is_feature_freeze_release:
+        subprocess.check_call(
+            ["git", "checkout", "main"],
+            cwd=db["git_repo"],
+        )
+    else:
+        subprocess.check_call(
+            ["git", "checkout", release_tag.branch],
+            cwd=db["git_repo"],
+        )
+
+    subprocess.check_call(
+        ["git", "merge", "--no-squash", f"v{db['release']}"],
+        cwd=db["git_repo"],
+    )
+
+
+def post_release_tagging(db: ReleaseShelf) -> None:
+    release_tag: release_mod.Tag = db["release"]
+
+    subprocess.check_call(
+        ["git", "fetch", "--all"],
+        cwd=db["git_repo"],
+    )
+
+    subprocess.check_call(
+        ["git", "checkout", release_tag.branch],
+        cwd=db["git_repo"],
+    )
+
+    with cd(db["git_repo"]):
+        release_mod.done(db["release"])
+
+    subprocess.check_call(
+        ["git", "commit", "-a", "-m", f"Post {db['release']}"],
+        cwd=db["git_repo"],
+    )
+
+
+def maybe_prepare_new_main_branch(db: ReleaseShelf) -> None:
+    release_tag: release_mod.Tag = db["release"]
+
+    if not release_tag.is_feature_freeze_release:
+        return
+
+    subprocess.check_call(
+        ["git", "checkout", "main"],
+        cwd=db["git_repo"],
+    )
+
+    new_release = release_tag.next_minor_release()
+    with cd(db["git_repo"]):
+        release_mod.bump(new_release)
+
+    prev_branch = f"{release_tag.major}.{release_tag.minor}"
+    new_branch = f"{release_tag.major}.{int(release_tag.minor)+1}"
+    whatsnew_file = f"Doc/whatsnew/{new_branch}.rst"
+    with cd(db["git_repo"]), open(whatsnew_file, "w") as f:
+        f.write(WHATS_NEW_TEMPLATE.format(version=new_branch, prev_version=prev_branch))
+
+    subprocess.check_call(
+        ["git", "add", whatsnew_file],
+        cwd=db["git_repo"],
+    )
+
+    whatsnew_toctree_file = "Doc/whatsnew/index.rst"
+    with cd(db["git_repo"]):
+        update_whatsnew_toctree(db, whatsnew_toctree_file)
+
+    subprocess.check_call(
+        ["git", "add", whatsnew_toctree_file],
+        cwd=db["git_repo"],
+    )
+
+    subprocess.check_call(
+        ["git", "commit", "-a", "-m", f"Python {new_release}"],
+        cwd=db["git_repo"],
+    )
+
+
+def update_whatsnew_toctree(db: ReleaseShelf, filename: str) -> None:
+    release_tag: release_mod.Tag = db["release"]
+    this_rst = f"   {release_tag.major}.{release_tag.minor}.rst"
+    next_rst = f"   {release_tag.major}.{release_tag.minor+1}.rst"
+    new = next_rst + "\n" + this_rst
+
+    with open(filename) as f:
+        contents = f.read()
+    contents = contents.replace(this_rst, new)
+    with open(filename, "w") as f:
+        f.write(contents)
+
+
+def branch_new_versions(db: ReleaseShelf) -> None:
+    release_tag: release_mod.Tag = db["release"]
+
+    if not release_tag.is_feature_freeze_release:
+        return
+
+    subprocess.check_call(["git", "checkout", "main"], cwd=db["git_repo"])
+
+    subprocess.check_call(
+        ["git", "checkout", "-b", release_tag.branch],
+        cwd=db["git_repo"],
+    )
+
+
+def is_mirror(repo: Path, remote: str) -> bool:
+    """Return True if the `repo` directory was created with --mirror."""
+
+    cmd = ["git", "config", "--local", "--get", f"remote.{remote}.mirror"]
+    try:
+        out = subprocess.check_output(cmd, cwd=repo)
+    except subprocess.CalledProcessError:
+        return False
+    return out.startswith(b"true")
+
+
+def push_to_local_fork(db: ReleaseShelf) -> None:
+    def _push_to_local(dry_run: bool = False) -> None:
+        git_command = ["git", "push"]
+        if dry_run:
+            git_command.append("--dry-run")
+
+        git_command.append("origin")
+        if not is_mirror(db["git_repo"], "origin"):
+            # mirrors push everything always, specifying `--tags` or refspecs doesn't work.
+            git_command += ["HEAD", "--tags"]
+
+        subprocess.check_call(
+            git_command,
+            cwd=db["git_repo"],
+        )
+
+    _push_to_local(dry_run=True)
+    if not ask_question(
+        "Does these operations look reasonable? ⚠️⚠️⚠️ Answering 'yes' will push to your origin remote ⚠️⚠️⚠️"
+    ):
+        raise ReleaseException("Something is wrong - Push to remote aborted")
+    _push_to_local(dry_run=False)
+
+
+def push_to_upstream(db: ReleaseShelf) -> None:
+    release_tag: release_mod.Tag = db["release"]
+
+    def _push_to_upstream(dry_run: bool = False) -> None:
+        branch = f"{release_tag.major}.{release_tag.minor}"
+        git_command = ["git", "push"]
+        if dry_run:
+            git_command.append("--dry-run")
+
+        if release_tag.is_alpha_release:
+            subprocess.check_call(
+                git_command + ["--tags", "git@github.com:python/cpython.git", "main"],
+                cwd=db["git_repo"],
+            )
+        elif release_tag.is_feature_freeze_release:
+            subprocess.check_call(
+                git_command + ["--tags", "git@github.com:python/cpython.git", branch],
+                cwd=db["git_repo"],
+            )
+            subprocess.check_call(
+                git_command + ["--tags", "git@github.com:python/cpython.git", "main"],
+                cwd=db["git_repo"],
+            )
+        else:
+            subprocess.check_call(
+                git_command + ["--tags", "git@github.com:python/cpython.git", branch],
+                cwd=db["git_repo"],
+            )
+
+    _push_to_upstream(dry_run=True)
+    if not ask_question(
+        "Do these operations look reasonable? ⚠️⚠️⚠️ Answering 'yes' will push to the upstream repository ⚠️⚠️⚠️"
+    ):
+        raise ReleaseException("Something is wrong - Push to upstream aborted")
+    if not ask_question(
+        "Is the target branch unprotected for your user? "
+        "Check at https://github.com/python/cpython/settings/branches"
+    ):
+        raise ReleaseException("The target branch is not unprotected for your user")
+    _push_to_upstream(dry_run=False)
+
+
+def main() -> None:
+
+    parser = argparse.ArgumentParser(description="Make a CPython release.")
+
+    def _release_type(release: str) -> str:
+        if not RELEASE_REGEXP.match(release):
+            raise argparse.ArgumentTypeError("Invalid release string")
+        return release
+
+    parser.add_argument(
+        "--release",
+        dest="release",
+        help="Release tag",
+        required=True,
+        type=_release_type,
+    )
+    parser.add_argument(
+        "--repository",
+        dest="repo",
+        help="Location of the CPython repository",
+        required=True,
+        type=str,
+    )
+
+    def _api_key(api_key: str) -> str:
+        if not API_KEY_REGEXP.match(api_key):
+            raise argparse.ArgumentTypeError(
+                "Invalid API key format. It must be on the form USER:API_KEY"
+            )
+        return api_key
+
+    parser.add_argument(
+        "--auth-key",
+        dest="auth_key",
+        help="API key for python.org in the form 'USER:API_KEY'",
+        type=_api_key,
+    )
+    parser.add_argument(
+        "--ssh-user",
+        dest="ssh_user",
+        default=getpass.getuser(),
+        help="Username to be used when authenticating via ssh",
+        type=str,
+    )
+    parser.add_argument(
+        "--ssh-key",
+        dest="ssh_key",
+        default=None,
+        help="Path to the SSH key file to use for authentication",
+        type=str,
+    )
+    args = parser.parse_args()
+
+    auth_key = args.auth_key or os.getenv("AUTH_INFO")
+    assert isinstance(auth_key, str), "We need an AUTH_INFO env var or --auth-key"
+
+    if sys.platform not in ("darwin", "linux"):
+        print(
+            """\
+WARNING! This script has not been tested on a platform other than Linux and macOS.
+
+Although it should work correctly as long as you have all the dependencies,
+some things may not work as expected. As a release manager, you should try to
+fix these things in this script so it also supports your platform.
+"""
+        )
+        if not ask_question("Do you want to continue?"):
+            raise ReleaseException(
+                "This release script is not compatible with the running platform"
+            )
+
+    release_tag = release_mod.Tag(args.release)
+    magic = release_tag.as_tuple() >= (3, 14)
+    no_gpg = release_tag.as_tuple() >= (3, 14)  # see PEP 761
+    tasks = [
+        Task(check_gh, "Checking gh is available"),
+        Task(check_git, "Checking Git is available"),
+        Task(check_make, "Checking make is available"),
+        Task(check_blurb, "Checking blurb is available"),
+        Task(check_docker, "Checking Docker is available"),
+        Task(check_docker_running, "Checking Docker is running"),
+        Task(check_autoconf, "Checking autoconf is available"),
+        *([] if no_gpg else [Task(check_gpg_keys, "Checking GPG keys")]),
+        Task(
+            check_ssh_connection,
+            f"Validating ssh connection to {DOWNLOADS_SERVER} and {DOCS_SERVER}",
+        ),
+        Task(check_sigstore_client, "Checking Sigstore CLI"),
+        Task(check_buildbots, "Check buildbots are good"),
+        Task(check_cpython_repo_branch, "Checking CPython repository branch"),
+        Task(check_cpython_repo_age, "Checking CPython repository age"),
+        Task(check_cpython_repo_is_clean, "Checking CPython repository is clean"),
+        *(
+            [Task(check_magic_number, "Checking the magic number is up-to-date")]
+            if magic
+            else []
+        ),
+        Task(prepare_temporary_branch, "Checking out a temporary release branch"),
+        Task(run_blurb_release, "Run blurb release"),
+        Task(check_cpython_repo_is_clean, "Checking CPython repository is clean"),
+        Task(prepare_pydoc_topics, "Preparing pydoc topics"),
+        Task(bump_version, "Bump version"),
+        Task(bump_version_in_docs, "Bump version in docs"),
+        Task(check_cpython_repo_is_clean, "Checking CPython repository is clean"),
+        Task(run_autoconf, "Running autoconf"),
+        Task(check_cpython_repo_is_clean, "Checking CPython repository is clean"),
+        Task(check_pyspecific, "Checking pyspecific"),
+        Task(check_cpython_repo_is_clean, "Checking CPython repository is clean"),
+        Task(create_tag, "Create tag"),
+        Task(push_to_local_fork, "Push new tags and branches to private fork"),
+        Task(start_build_release, "Start the build-release workflow"),
+        Task(
+            send_email_to_platform_release_managers,
+            "Platform release managers have been notified of the commit SHA",
+        ),
+        Task(wait_for_build_release, "Wait for build-release workflow"),
+        Task(check_doc_unreleased_version, "Check docs for `(unreleased)`"),
+        Task(build_sbom_artifacts, "Building SBOM artifacts"),
+        *([] if no_gpg else [Task(sign_source_artifacts, "Sign source artifacts")]),
+        Task(
+            upload_files_to_downloads_server, "Upload files to the PSF downloads server"
+        ),
+        Task(place_files_in_download_folder, "Place files in the download folder"),
+        Task(upload_docs_to_the_docs_server, "Upload docs to the PSF docs server"),
+        Task(unpack_docs_in_the_docs_server, "Place docs files in the docs folder"),
+        Task(wait_until_all_files_are_in_folder, "Wait until all files are ready"),
+        Task(create_release_object_in_db, "The Django release object has been created"),
+        Task(post_release_merge, "Merge the tag into the release branch"),
+        Task(branch_new_versions, "Branch out new versions and prepare main branch"),
+        Task(post_release_tagging, "Final touches for the release"),
+        Task(
+            maybe_prepare_new_main_branch,
+            "prepare new main branch for feature freeze",
+        ),
+        Task(push_to_upstream, "Push new tags and branches to upstream"),
+        Task(remove_temporary_branch, "Removing temporary release branch"),
+        Task(run_add_to_python_dot_org, "Add files to python.org download page"),
+        Task(purge_the_cdn, "Purge the CDN of python.org/downloads"),
+        Task(announce_release, "Announce the release"),
+    ]
+    automata = ReleaseDriver(
+        git_repo=args.repo,
+        release_tag=release_tag,
+        api_key=auth_key,
+        ssh_user=args.ssh_user,
+        sign_gpg=not no_gpg,
+        ssh_key=args.ssh_key,
+        tasks=tasks,
+    )
+    automata.run()
+
+
+if __name__ == "__main__":
+    main()
+
+#!/usr/bin/env python3
+
+"""An assistant for making Python releases.
+
+Original code by Benjamin Peterson
+Additions by Barry Warsaw, Georg Brandl and Benjamin Peterson
+"""
+
+from __future__ import annotations
+
+import datetime
+import glob
+import hashlib
+import json
+import optparse
+import os
+import re
+import readline  # noqa: F401
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import cache
+from pathlib import Path
+from typing import (
+    Any,
+    Literal,
+    Protocol,
+    Self,
+    overload,
+)
+from urllib.request import urlopen
+
+COMMASPACE = ", "
+SPACE = " "
+tag_cre = re.compile(r"(\d+)(?:\.(\d+)(?:\.(\d+))?)?(?:([ab]|rc)(\d+))?$")
+
+
+class ReleaseShelf(Protocol):
+    def close(self) -> None: ...
+
+    @overload
+    def get(self, key: Literal["finished"], default: bool | None = None) -> bool: ...
+
+    @overload
+    def get(
+        self, key: Literal["completed_tasks"], default: list[Task] | None = None
+    ) -> list[Task]: ...
+
+    @overload
+    def get(self, key: Literal["gpg_key"], default: str | None = None) -> str: ...
+
+    @overload
+    def get(self, key: Literal["git_repo"], default: Path | None = None) -> Path: ...
+
+    @overload
+    def get(self, key: Literal["auth_info"], default: str | None = None) -> str: ...
+
+    @overload
+    def get(self, key: Literal["ssh_user"], default: str | None = None) -> str: ...
+
+    @overload
+    def get(
+        self, key: Literal["ssh_key"], default: str | None = None
+    ) -> str | None: ...
+
+    @overload
+    def get(self, key: Literal["sign_gpg"], default: bool | None = None) -> bool: ...
+
+    @overload
+    def get(
+        self, key: Literal["security_release"], default: bool | None = None
+    ) -> bool: ...
+
+    @overload
+    def get(self, key: Literal["release"], default: Tag | None = None) -> Tag: ...
+
+    @overload
+    def __getitem__(self, key: Literal["finished"]) -> bool: ...
+
+    @overload
+    def __getitem__(self, key: Literal["completed_tasks"]) -> list[Task]: ...
+
+    @overload
+    def __getitem__(self, key: Literal["gpg_key"]) -> str: ...
+
+    @overload
+    def __getitem__(self, key: Literal["git_repo"]) -> Path: ...
+
+    @overload
+    def __getitem__(self, key: Literal["auth_info"]) -> str: ...
+
+    @overload
+    def __getitem__(self, key: Literal["ssh_user"]) -> str: ...
+
+    @overload
+    def __getitem__(self, key: Literal["ssh_key"]) -> str | None: ...
+
+    @overload
+    def __getitem__(self, key: Literal["sign_gpg"]) -> bool: ...
+
+    @overload
+    def __getitem__(self, key: Literal["security_release"]) -> bool: ...
+
+    @overload
+    def __getitem__(self, key: Literal["release"]) -> Tag: ...
+
+    @overload
+    def __setitem__(self, key: Literal["finished"], value: bool) -> None: ...
+
+    @overload
+    def __setitem__(
+        self, key: Literal["completed_tasks"], value: list[Task]
+    ) -> None: ...
+
+    @overload
+    def __setitem__(self, key: Literal["gpg_key"], value: str) -> None: ...
+
+    @overload
+    def __setitem__(self, key: Literal["git_repo"], value: Path) -> None: ...
+
+    @overload
+    def __setitem__(self, key: Literal["auth_info"], value: str) -> None: ...
+
+    @overload
+    def __setitem__(self, key: Literal["ssh_user"], value: str) -> None: ...
+
+    @overload
+    def __setitem__(self, key: Literal["ssh_key"], value: str | None) -> None: ...
+
+    @overload
+    def __setitem__(self, key: Literal["sign_gpg"], value: bool) -> None: ...
+
+    @overload
+    def __setitem__(self, key: Literal["security_release"], value: bool) -> None: ...
+
+    @overload
+    def __setitem__(self, key: Literal["release"], value: Tag) -> None: ...
+
+
+@dataclass
+class Task:
+    function: Callable[[ReleaseShelf], None]
+    description: str
+
+    def __call__(self, db: ReleaseShelf) -> Any:
+        return getattr(self, "function")(db)
+
+
+class Tag:
+    def __init__(self, tag_name: str) -> None:
+        # if tag is ".", use current directory name as tag
+        # e.g. if current directory name is "3.4.6",
+        # "release.py --bump 3.4.6" and "release.py --bump ." are the same
+        if tag_name == ".":
+            tag_name = os.path.basename(os.getcwd())
+        result = tag_cre.match(tag_name)
+        if result is None:
+            error(f"tag {tag_name} is not valid")
+        assert result is not None
+        data = list(result.groups())
+        if data[3] is None:
+            # A final release.
+            self.is_final = True
+            data[3] = "f"
+        else:
+            self.is_final = False
+        # For everything else, None means 0.
+        for i, thing in enumerate(data):
+            if thing is None:
+                data[i] = 0
+        self.major = int(data[0])
+        self.minor = int(data[1])
+        self.patch = int(data[2])
+        self.level = data[3]
+        self.serial = int(data[4])
+        # This has the effect of normalizing the version.
+        self.text = self.normalized()
+        if self.level != "f":
+            assert self.level is not None
+            self.text += self.level + str(self.serial)
+        self.basic_version = f"{self.major}.{self.minor}"
+
+    def __str__(self) -> str:
+        return self.text
+
+    def normalized(self) -> str:
+        return f"{self.major}.{self.minor}.{self.patch}"
+
+    @property
+    def branch(self) -> str:
+        return "main" if self.is_alpha_release else f"{self.major}.{self.minor}"
+
+    @property
+    def is_alpha_release(self) -> bool:
+        return self.level == "a"
+
+    @property
+    def is_release_candidate(self) -> bool:
+        return self.level == "rc"
+
+    @property
+    def is_feature_freeze_release(self) -> bool:
+        return self.level == "b" and self.serial == 1
+
+    @property
+    def is_security_release(self) -> bool:
+        url = "https://peps.python.org/api/release-cycle.json"
+        with urlopen(url) as response:
+            data = json.loads(response.read())
+        return str(data[self.basic_version]["status"]) == "security"
+
+    @property
+    def nickname(self) -> str:
+        return self.text.replace(".", "")
+
+    @property
+    def gitname(self) -> str:
+        return "v" + self.text
+
+    @property
+    def long_name(self) -> str:
+        if self.is_final:
+            return self.text
+
+        level = {
+            "a": "alpha",
+            "b": "beta",
+            "rc": "release candidate",
+        }[self.level]
+        return f"{self.normalized()} {level} {self.serial}"
+
+    def next_minor_release(self) -> Self:
+        return self.__class__(f"{self.major}.{int(self.minor)+1}.0a0")
+
+    def as_tuple(self) -> tuple[int, int, int, str, int]:
+        assert isinstance(self.level, str)
+        return self.major, self.minor, self.patch, self.level, self.serial
+
+    @property
+    def committed_at(self) -> datetime.datetime:
+        # Fetch the epoch of the tagged commit for build reproducibility.
+        proc = subprocess.run(
+            ["git", "log", self.gitname, "-1", "--pretty=%ct"], stdout=subprocess.PIPE
+        )
+        if proc.returncode != 0:
+            error(f"Couldn't fetch the epoch of tag {self.gitname}")
+        return datetime.datetime.fromtimestamp(
+            int(proc.stdout.decode().strip()), tz=datetime.timezone.utc
+        )
+
+    @property
+    def includes_docs(self) -> bool:
+        """True if docs should be included in the release"""
+        return self.is_final or self.is_release_candidate
+
+    @property
+    def doc_version(self) -> str:
+        """Text used for notes in docs like 'Added in x.y'"""
+        # - ignore levels (alpha/beta/rc are preparation for the full release)
+        # - use just X.Y for patch 0
+        if self.patch == 0:
+            return f"{self.major}.{self.minor}"
+        else:
+            return f"{self.major}.{self.minor}.{self.patch}"
+
+
+def error(*msgs: str) -> None:
+    print("**ERROR**", file=sys.stderr)
+    for msg in msgs:
+        print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def run_cmd(
+    cmd: Sequence[str] | str, silent: bool = False, shell: bool = False, **kwargs: Any
+) -> None:
+    if shell:
+        cmd = SPACE.join(cmd)
+    if not silent:
+        print(f"Executing {cmd}")
+    try:
+        if silent:
+            subprocess.check_call(cmd, shell=shell, stdout=subprocess.PIPE, **kwargs)
+        else:
+            subprocess.check_call(cmd, shell=shell, **kwargs)
+    except subprocess.CalledProcessError:
+        error(f"{cmd} failed")
+
+
+def ask_question(question: str) -> bool:
+    answer = ""
+    print(question)
+    while answer not in ("yes", "no"):
+        answer = input("Enter yes or no: ")
+        if answer == "yes":
+            return True
+        elif answer == "no":
+            return False
+        else:
+            print("Please enter yes or no.")
+    return True
+
+
+readme_re = re.compile(r"This is Python version 3\.\d").match
+
+
+def chdir_to_repo_root() -> str:
+    # find the root of the local CPython repo
+    # note that we can't ask git, because we might
+    # be in an exported directory tree!
+
+    # we intentionally start in a (probably nonexistent) subtree
+    # the first thing the while loop does is .., basically
+    path = os.path.abspath("garglemox")
+    while True:
+        next_path = os.path.dirname(path)
+        if next_path == path:
+            sys.exit("You're not inside a CPython repo right now!")
+        path = next_path
+
+        os.chdir(path)
+
+        def test_first_line(
+            filename: str,
+            test: Callable[[str], object],
+        ) -> bool:
+            if not os.path.exists(filename):
+                return False
+            with open(filename) as f:
+                lines = f.read().split("\n")
+                if not (lines and test(lines[0])):
+                    return False
+            return True
+
+        if not test_first_line("README.rst", readme_re):
+            continue
+        if not test_first_line("LICENSE", "A. HISTORY OF THE SOFTWARE".__eq__):
+            continue
+        if not os.path.exists("Include/Python.h"):
+            continue
+        if not os.path.exists("Python/ceval.c"):
+            continue
+
+        break
+
+    root = path
+    return root
+
+
+def get_output(args: list[str]) -> bytes:
+    return subprocess.check_output(args)
+
+
+def check_env() -> None:
+    if "EDITOR" not in os.environ:
+        error("editor not detected.", "Please set your EDITOR environment variable")
+    if not os.path.exists(".git"):
+        error("CWD is not a git clone")
+
+
+def get_arg_parser() -> optparse.OptionParser:
+    usage = "%prog [options] tagname"
+    p = optparse.OptionParser(usage=usage)
+    p.add_option(
+        "-b",
+        "--bump",
+        default=False,
+        action="store_true",
+        help="bump the revision number in important files",
+    )
+    p.add_option(
+        "-e",
+        "--export",
+        default=False,
+        action="store_true",
+        help="Export the git tag to a tarball and build docs",
+    )
+    p.add_option(
+        "-u",
+        "--upload",
+        metavar="username",
+        help="Upload the tarballs and docs to dinsdale",
+    )
+    p.add_option(
+        "-m",
+        "--branch",
+        default=False,
+        action="store_true",
+        help="Create a maintenance branch to go along with the release",
+    )
+    p.add_option(
+        "-t",
+        "--tag",
+        default=False,
+        action="store_true",
+        help="Tag the release in Subversion",
+    )
+    p.add_option(
+        "-d",
+        "--done",
+        default=False,
+        action="store_true",
+        help="Do post-release cleanups (i.e.  you're done!)",
+    )
+    p.add_option(
+        "--skip-docs",
+        default=False,
+        action="store_true",
+        help="Skip building the documentation during export",
+    )
+    return p
+
+
+def constant_replace(
+    filename: str,
+    updated_constants: str,
+    comment_start: str = "/*",
+    comment_end: str = "*/",
+) -> None:
+    """Inserts in between --start constant-- and --end constant-- in a file"""
+    start_tag = comment_start + "--start constants--" + comment_end
+    end_tag = comment_start + "--end constants--" + comment_end
+    with open(filename, encoding="ascii") as infile, open(
+        filename + ".new", "w", encoding="ascii"
+    ) as outfile:
+        found_constants = False
+        waiting_for_end = False
+        for line in infile:
+            if line[:-1] == start_tag:
+                print(start_tag, file=outfile)
+                print(updated_constants, file=outfile)
+                print(end_tag, file=outfile)
+                waiting_for_end = True
+                found_constants = True
+            elif line[:-1] == end_tag:
+                waiting_for_end = False
+            elif waiting_for_end:
+                pass
+            else:
+                outfile.write(line)
+    if not found_constants:
+        error(f"Constant section delimiters not found: {filename}")
+    os.rename(filename + ".new", filename)
+
+
+def tweak_patchlevel(
+    tag: Tag, filename: str = "Include/patchlevel.h", done: bool = False
+) -> None:
+    print(f"Updating {filename}...", end=" ")
+    template = '''
+#define PY_MAJOR_VERSION\t{tag.major}
+#define PY_MINOR_VERSION\t{tag.minor}
+#define PY_MICRO_VERSION\t{tag.patch}
+#define PY_RELEASE_LEVEL\t{level_def}
+#define PY_RELEASE_SERIAL\t{tag.serial}
+
+/* Version as a string */
+#define PY_VERSION      \t\"{tag.text}{plus}"'''.strip()
+    assert isinstance(tag.level, str)
+    level_def = {
+        "a": "PY_RELEASE_LEVEL_ALPHA",
+        "b": "PY_RELEASE_LEVEL_BETA",
+        "rc": "PY_RELEASE_LEVEL_GAMMA",
+        "f": "PY_RELEASE_LEVEL_FINAL",
+    }[tag.level]
+    new_constants = template.format(
+        tag=tag, level_def=level_def, plus=done and "+" or ""
+    )
+    if tag.as_tuple() >= (3, 7, 0, "a", 3):
+        new_constants = new_constants.expandtabs()
+    constant_replace(filename, new_constants)
+    print("done")
+
+
+@cache
+def get_pep_number(version: str) -> str:
+    """Fetch PEP number for a Python version from peps.python.org.
+
+    Returns the PEP number as a string, or "TODO" if not found.
+    """
+    url = "https://peps.python.org/api/release-cycle.json"
+    with urllib.request.urlopen(url, timeout=10) as response:
+        data = json.loads(response.read().decode())
+        if version in data:
+            pep = data[version].get("pep")
+            if pep:
+                return str(pep)
+    return "TODO"
+
+
+def tweak_readme(tag: Tag, filename: str = "README.rst") -> None:
+    print(f"Updating {filename}...", end=" ")
+    readme = Path(filename)
+
+    # Update first line: "This is Python version X.Y.Z {release_level} N"
+    # and update length of underline in second line to match.
+    lines = readme.read_text().split("\n")
+    this_is = f"This is Python version {tag.long_name}"
+    underline = "=" * len(this_is)
+    lines[0] = this_is
+    lines[1] = underline
+    content = "\n".join(lines)
+
+    DOCS_URL = r"https://docs\.python\.org/"
+    X_Y = r"\d+\.\d+"
+
+    # Replace in: 3.14 <https://docs.python.org/3.14/whatsnew/3.14.html>`_
+    content = re.sub(
+        rf"{X_Y} (<{DOCS_URL}){X_Y}(/whatsnew/){X_Y}(\.html>`_)",
+        rf"{tag.basic_version} \g<1>{tag.basic_version}\g<2>{tag.basic_version}\g<3>",
+        content,
+    )
+
+    # Replace in: `Documentation for Python 3.14 <https://docs.python.org/3.14/>`_
+    content = re.sub(
+        rf"(`Documentation for Python ){X_Y}( <{DOCS_URL}){X_Y}(/>`_)",
+        rf"\g<1>{tag.basic_version}\g<2>{tag.basic_version}\g<3>",
+        content,
+    )
+
+    # Get PEP number for this version
+    pep_number = get_pep_number(tag.basic_version)
+    pep_padded = pep_number.zfill(4) if pep_number != "TODO" else "TODO"
+
+    # Replace in: `PEP 745 <https://peps.python.org/pep-0745/>`__ for Python 3.14
+    content = re.sub(
+        rf"(`PEP )\d+( <https://peps\.python\.org/pep-)\d+(/>`__ for Python ){X_Y}",
+        rf"\g<1>{pep_number}\g<2>{pep_padded}\g<3>{tag.basic_version}",
+        content,
+    )
+
+    readme.write_text(content)
+    print("done")
+
+
+def bump(tag: Tag) -> None:
+    print(f"Bumping version to {tag}")
+
+    tweak_patchlevel(tag)
+    tweak_readme(tag)
+
+    extra_work = False
+    other_files = []
+    if tag.patch == 0 and tag.level == "a" and tag.serial == 0:
+        extra_work = True
+        other_files += [
+            "configure.ac",
+            "Doc/tutorial/interpreter.rst",
+            "Doc/tutorial/stdlib.rst",
+            "Doc/tutorial/stdlib2.rst",
+            "PC/pyconfig.h.in",
+            "PCbuild/rt.bat",
+            ".github/ISSUE_TEMPLATE/bug.yml",
+            ".github/ISSUE_TEMPLATE/crash.yml",
+        ]
+    print("\nManual editing time...")
+    for filename in other_files:
+        if os.path.exists(filename):
+            print(f"Edit {filename}")
+            manual_edit(filename)
+        else:
+            print(f"Skipping {filename}")
+
+    print("Bumped revision")
+    if extra_work:
+        print("configure.ac has changed; re-run autotools!")
+    print("Please commit and use --tag")
+
+
+def manual_edit(filename: str) -> None:
+    editor = os.environ["EDITOR"].split()
+    run_cmd([*editor, filename])
+
+
+@contextmanager
+def pushd(new: str) -> Generator[None, None, None]:
+    print(f"chdir'ing to {new}")
+    old = os.getcwd()
+    os.chdir(new)
+    try:
+        yield
+    finally:
+        os.chdir(old)
+
+
+def make_dist(name: str) -> None:
+    try:
+        os.mkdir(name)
+    except OSError:
+        if os.path.isdir(name):
+            print(f"WARNING: dist dir {name} already exists", file=sys.stderr)
+        else:
+            error(f"{name}/ is not a directory")
+    else:
+        print(f"created dist directory {name}")
+
+
+def tarball(source: str, clamp_mtime: str) -> None:
+    """Build tarballs for a directory."""
+    print("Making .tgz")
+    base = os.path.basename(source)
+    tgz = os.path.join("src", base + ".tgz")
+    xz = os.path.join("src", base + ".tar.xz")
+    # Recommended options for creating reproducible tarballs from:
+    # https://www.gnu.org/software/tar/manual/html_node/Reproducibility.html#Reproducibility
+    # and https://reproducible-builds.org/docs/archives/
+    repro_options = [
+        # Sorts the entries in the tarball by name.
+        "--sort=name",
+        # Sets a maximum 'modified time' of entries in tarball.
+        f"--mtime={clamp_mtime}",
+        "--clamp-mtime",
+        # Sets the owner uid and gid to 0.
+        "--owner=0",
+        "--group=0",
+        "--numeric-owner",
+        # Omits process ID, file access, and status change times.
+        "--pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime",
+        # Omit irrelevant info about file permissions.
+        "--mode=go+u,go-w",
+    ]
+    run_cmd(
+        [
+            "tar",
+            "cf",
+            tgz,
+            *repro_options,
+            "--use-compress-program",
+            "gzip --no-name -9",
+            source,
+        ]
+    )
+    print("Making .tar.xz")
+    run_cmd(["tar", "cJf", xz, *repro_options, source])
+    print("Calculating SHA-256 sums")
+    checksum_tgz = hashlib.sha256()
+    with open(tgz, "rb") as data:
+        checksum_tgz.update(data.read())
+    checksum_xz = hashlib.sha256()
+    with open(xz, "rb") as data:
+        checksum_xz.update(data.read())
+    print(f"  {checksum_tgz.hexdigest()}  {os.path.getsize(tgz):8}  {tgz}")
+    print(f"  {checksum_xz.hexdigest()}  {os.path.getsize(xz):8}  {xz}")
+
+
+def export(tag: Tag, silent: bool = False, skip_docs: bool = False) -> None:
+    make_dist(tag.text)
+    print("Exporting tag:", tag.text)
+    archivename = f"Python-{tag.text}"
+    # I have not figured out how to get git to directly produce an
+    # archive directory like hg can, so use git to produce a temporary
+    # tarball then expand it with tar.
+    archivetempfile = f"{archivename}.tar"
+    run_cmd(
+        [
+            "git",
+            "archive",
+            "--format=tar",
+            f"--prefix={archivename}/",
+            "-o",
+            archivetempfile,
+            tag.gitname,
+        ],
+        silent=silent,
+    )
+    with pushd(tag.text):
+        archivetempfile = f"../{archivetempfile}"
+        run_cmd(["tar", "-xf", archivetempfile], silent=silent)
+        os.unlink(archivetempfile)
+        with pushd(archivename):
+            # Touch a few files that get generated so they're up-to-date in
+            # the tarball.
+            #
+            # Note, with the demise of "make touch" and the hg touch
+            # extension, touches should not be needed anymore,
+            # but keep it for now as a reminder.
+            maybe_touchables = [
+                "Include/internal/pycore_ast.h",
+                "Include/internal/pycore_ast_state.h",
+                "Python/Python-ast.c",
+                "Python/opcode_targets.h",
+            ]
+            touchables = [file for file in maybe_touchables if os.path.exists(file)]
+            print(
+                "Touching:",
+                COMMASPACE.join(name.rsplit("/", 1)[-1] for name in touchables),
+            )
+            for name in touchables:
+                os.utime(name, None)
+
+            # build docs *before* we do "blurb export"
+            # because docs now depend on Misc/NEWS.d
+            # and we remove Misc/NEWS.d as part of cleanup for export
+            #
+            # If --skip-docs is provided we don't build and docs.
+            if not skip_docs and (tag.is_final or tag.level == "rc"):
+                docdist = build_docs()
+
+            print("Using blurb to build Misc/NEWS")
+            run_cmd(["blurb", "merge"], silent=silent)
+
+            # Remove files we don't want to ship in tarballs.
+            print("Removing VCS .*ignore, .git*, Misc/NEWS.d, et al")
+            for name in (".gitattributes", ".gitignore"):
+                try:
+                    os.unlink(name)
+                except OSError:
+                    pass
+
+            # Remove directories we don't want to ship in tarballs.
+            run_cmd(["blurb", "export"], silent=silent)
+            for name in (".azure-pipelines", ".git", ".github", "Misc/mypy"):
+                shutil.rmtree(name, ignore_errors=True)
+
+        if not skip_docs and (tag.is_final or tag.level == "rc"):
+            shutil.copytree(docdist, "docs")
+
+        with pushd(os.path.join(archivename, "Doc")):
+            print("Removing doc build artifacts")
+            shutil.rmtree("venv", ignore_errors=True)
+            shutil.rmtree("build", ignore_errors=True)
+            shutil.rmtree("dist", ignore_errors=True)
+
+        with pushd(archivename):
+            print("Zapping pycs")
+            run_cmd(
+                [
+                    "find",
+                    ".",
+                    "-depth",
+                    "-name",
+                    "__pycache__",
+                    "-exec",
+                    "rm",
+                    "-rf",
+                    "{}",
+                    ";",
+                ],
+                silent=silent,
+            )
+            run_cmd(
+                ["find", ".", "-name", "*.py[co]", "-exec", "rm", "-f", "{}", ";"],
+                silent=silent,
+            )
+
+        os.mkdir("src")
+        tarball(archivename, tag.committed_at.strftime("%Y-%m-%d %H:%M:%SZ"))
+    print()
+    print(f"**Now extract the archives in {tag.text}/src and run the tests**")
+    print("**You may also want to run make install and re-test**")
+
+
+def build_docs() -> str:
+    """Build and tarball the documentation"""
+    print("Building docs")
+    with tempfile.TemporaryDirectory() as venv:
+        run_cmd(["python3", "-m", "venv", venv])
+        pip = os.path.join(venv, "bin", "pip")
+        run_cmd([pip, "install", "-r", "Doc/requirements.txt"])
+        sphinx_build = os.path.join(venv, "bin", "sphinx-build")
+        blurb = os.path.join(venv, "bin", "blurb")
+        docs_env = {
+            **os.environ,
+            "BLURB": blurb,
+            "SPHINXBUILD": sphinx_build,
+            "SPHINXOPTS": "-j10",
+        }
+        with pushd("Doc"):
+            run_cmd(("make", "dist-epub"), env=docs_env)
+            run_cmd(("make", "dist-html"), env=docs_env)
+            run_cmd(("make", "dist-texinfo"), env=docs_env)
+            run_cmd(("make", "dist-text"), env=docs_env)
+            return os.path.abspath("dist")
+
+
+def upload(tag: Tag, username: str) -> None:
+    """scp everything to dinsdale"""
+    address = f'"{username}@dinsdale.python.org:'
+
+    def scp(from_loc: str, to_loc: str) -> None:
+        run_cmd(["scp", from_loc, address + to_loc])
+
+    with pushd(tag.text):
+        print("Uploading source tarballs")
+        scp("src", f"/data/python-releases/{tag.nickname}")
+        print("Upload doc tarballs")
+        scp("docs", f"/data/python-releases/doc/{tag.nickname}")
+        print(
+            "* Now change the permissions on the tarballs so they are "
+            "writable by the webmaster group. *"
+        )
+
+
+def make_tag(tag: Tag, *, sign_gpg: bool = True) -> bool:
+    # make sure we've run blurb export
+    good_files = glob.glob("Misc/NEWS.d/" + str(tag) + ".rst")
+    bad_files = list(glob.glob("Misc/NEWS.d/next/*/0*.rst"))
+    bad_files.extend(glob.glob("Misc/NEWS.d/next/*/2*.rst"))
+    if bad_files or not good_files:
+        print('It doesn\'t look like you ran "blurb release" yet.')
+        if bad_files:
+            print("There are still reST files in NEWS.d/next/...")
+        if not good_files:
+            print(f"There is no Misc/NEWS.d/{tag}.rst file.")
+        if not ask_question("Are you sure you want to tag?"):
+            print("Aborting.")
+            return False
+
+    # make sure we're on the correct branch
+    if tag.patch > 0:
+        if (
+            get_output(["git", "name-rev", "--name-only", "HEAD"]).strip().decode()
+            != f"branch-{tag}"
+        ):
+            print("It doesn't look like you're on the correct branch.")
+            if not ask_question("Are you sure you want to tag?"):
+                print("Aborting.")
+                return False
+
+    if sign_gpg:
+        print("Signing tag")
+        uid = os.environ.get("GPG_KEY_FOR_RELEASE")
+        if not uid:
+            print("List of available private keys:")
+            run_cmd(['gpg -K | grep -A 1 "^sec"'], shell=True)
+            uid = input("Please enter key ID to use for signing: ")
+        run_cmd(
+            ["git", "tag", "-s", "-u", uid, tag.gitname, "-m", "Python " + str(tag)]
+        )
+    else:
+        print("Creating tag")
+        run_cmd(["git", "tag", tag.gitname, "-m", "Python " + str(tag)])
+
+    return True
+
+
+def done(tag: Tag) -> None:
+    tweak_patchlevel(tag, done=True)
+
+
+def main(argv: Any) -> None:
+    chdir_to_repo_root()
+    parser = get_arg_parser()
+    options, args = parser.parse_args(argv)
+    if options.skip_docs and not options.export:
+        error("--skip-docs option has no effect without --export")
+    if len(args) != 2:
+        if "RELEASE_TAG" not in os.environ:
+            parser.print_usage()
+            sys.exit(1)
+        tagname = os.environ["RELEASE_TAG"]
+    else:
+        tagname = args[1]
+    tag = Tag(tagname)
+    if not (options.export or options.upload):
+        check_env()
+    if options.bump:
+        bump(tag)
+    if options.tag:
+        make_tag(tag)
+    if options.export:
+        export(tag, skip_docs=options.skip_docs)
+    if options.upload:
+        upload(tag, options.upload)
+    if options.done:
+        done(tag)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
+
+import json
+from dataclasses import dataclass
+from typing import Any, cast
+
+from aiohttp.client import ClientSession
+
+JSON = dict[str, Any]
+
+
+@dataclass
+class Builder:
+    builderid: int
+    description: str | None
+    name: str
+    tags: list[str]
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.__dict__.update(**kwargs)
+
+    def __hash__(self) -> int:
+        return hash(self.builderid)
+
+
+class BuildBotAPI:
+    def __init__(self, session: ClientSession) -> None:
+        self._session = session
+
+    async def authenticate(self, token: str) -> None:
+        await self._session.get(
+            "https://buildbot.python.org/all/auth/login", params={"token": token}
+        )
+
+    async def _fetch_text(self, url: str) -> str:
+        async with self._session.get(url) as resp:
+            return await resp.text()
+
+    async def _fetch_json(self, url: str) -> JSON:
+        return cast(JSON, json.loads(await self._fetch_text(url)))
+
+    async def stable_builders(self, branch: str | None = None) -> dict[int, Builder]:
+        stable_builders = {
+            id: builder
+            for (id, builder) in (await self.all_builders(branch=branch)).items()
+            if "stable" in builder.tags
+        }
+        return stable_builders
+
+    async def all_builders(self, branch: str | None = None) -> dict[int, Builder]:
+        url = "https://buildbot.python.org/all/api/v2/builders"
+        if branch is not None:
+            url = f"{url}?tags__contains={branch}"
+        _builders: dict[str, Any] = await self._fetch_json(url)
+        builders = _builders["builders"]
+        all_builders = {
+            builder["builderid"]: Builder(**builder) for builder in builders
+        }
+        return all_builders
+
+    async def is_builder_failing_currently(self, builder: Builder) -> bool:
+        builds_: dict[str, Any] = await self._fetch_json(
+            f"https://buildbot.python.org/all/api/v2/builds?complete__eq=true"
+            f"&&builderid__eq={builder.builderid}&&order=-complete_at"
+            f"&&limit=1"
+        )
+        builds = builds_["builds"]
+        if not builds:
+            return False
+        (build,) = builds
+        if build["results"] == 2:
+            return True
+        return False
