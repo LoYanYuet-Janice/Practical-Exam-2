@@ -27,7 +27,6 @@ I do beseech you, good Clarence, for Edward
 
 train has 103,626 tokens
 validation has 11,515 tokens
-
 The total token count of the dataset is 115,141
 
 4. The first 20 lines of the generated samples
@@ -54,7 +53,7 @@ def create_pip_create_sbom(sbom_data: SBOM) -> None:
      release_tag, default: str | None) -> bool: ...
 
 
-5. My favorite generated snippet
+5. My favourite generated snippet
 
 ReleaseException("Checking GPG ️ release -tools"),
        Task(check_cpython_repo_is_clean, "Checking CPython repository is clean"),
